@@ -1,0 +1,164 @@
+//@version=6
+// Generalized Hurst exponent h(q) of log-volatility increments — "roughness"
+// and multifractality of volatility, per Takaishi, T. (2019), "Rough
+// volatility of Bitcoin", Finance Research Letters, using MF-DFA (Kantelhardt
+// et al., 2002). Companion to the Grobys (2023) MMAR panes (MMAR_Hurst_Exponent,
+// MMAR_PowerLaw_Alpha): those measure the persistence of the realized-variance
+// LEVEL. This h(q) instead measures the roughness of the realized-variance's
+// own period-to-period LOG-CHANGES — a different question about the same
+// underlying volatility process. h(2) < 0.5 = "rough" volatility (Takaishi
+// finds h(2)~0.14 for Bitcoin); h(q) varying with q (a nonzero spread between
+// h(low q) and h(high q)) is evidence of multifractal log-volatility.
+indicator("MMAR Rough Volatility h(q) [Takaishi 2019]", shorttitle = "MMAR Rough Vol h(q)", overlay = false, max_bars_back = 5000, precision = 4)
+
+// ============================ Inputs ============================
+grpRV = "Realized Variance / Log-Volatility"
+srcClose = input.source(close, "Source", group = grpRV)
+rvWindow = input.int(5, "RV aggregation (bars)", minval = 1, group = grpRV,
+     tooltip = "Bars summed into one realized-variance observation. 5 ≈ weekly, 20 ≈ monthly.")
+lvLag = input.int(5, "Log-volatility increment lag (Δ, bars)", minval = 1, group = grpRV,
+     tooltip = "LV_t = log(sqrt(RV_t)) - log(sqrt(RV_(t-Δ))). Set equal to RV aggregation for a like-for-like period-over-period comparison (Takaishi, 2019 uses Δ=1 day on daily RV).")
+
+grpEst = "Estimation Window"
+lookback = input.int(256, "Lookback (# LV observations)", minval = 32, group = grpEst,
+     tooltip = "Number of log-volatility-increment observations used to estimate h(q) via MF-DFA. Should be a power of two (N ∈ 2^k).")
+recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst)
+
+grpQ = "Generalized Hurst — q moments"
+qLow = input.float(-3.0, "Low q (weights small fluctuations)", maxval = -1.0, group = grpQ,
+     tooltip = "Negative q emphasizes small fluctuations. Must stay below -1 to avoid the 1/q singularity near q=0.")
+qHigh = input.float(5.0, "High q (weights large fluctuations)", minval = 1.0, group = grpQ,
+     tooltip = "Positive q emphasizes large fluctuations. Must stay above 1 to avoid the 1/q singularity near q=0.")
+showRefLines = input.bool(true, "Show h=0.5 (random walk / roughness boundary) line", group = grpQ)
+showTable = input.bool(true, "Show summary table", group = grpQ)
+
+// ============================ Log-volatility increments ============================
+logRet = math.log(srcClose / srcClose[1])
+rv = math.sum(logRet * logRet, rvWindow)
+logVol = 0.5 * math.log(rv)
+lv = logVol - logVol[lvLag]
+
+// ============================ Generalized MF-DFA h(q) — Kantelhardt et al. (2002), Eq. 4-8 ============================
+// At q=2 this reduces to classic DFA (as in the Hurst-Exponent companion
+// script), just with the fluctuation function averaged as Kantelhardt
+// defines it: mean((F^2)^(q/2))^(1/q), not mean(sqrt(F^2)).
+f_mfdfa(float[] z, int n, float q) =>
+    float[] y = array.new<float>(n)
+    float mZ = array.avg(z)
+    float cum = 0.0
+    for i = 0 to n - 1
+        cum += array.get(z, i) - mZ
+        array.set(y, i, cum)
+
+    int[] scales = array.new<int>()
+    int kk = 4
+    while kk <= n / 2
+        array.push(scales, kk)
+        kk *= 2
+
+    float[] logk = array.new<float>()
+    float[] logf = array.new<float>()
+    for si = 0 to array.size(scales) - 1
+        int k = array.get(scales, si)
+        int nseg = n / k
+        float sumFq = 0.0
+        for seg = 0 to nseg - 1
+            int start = seg * k
+            float sumT = 0.0
+            float sumY = 0.0
+            float sumTT = 0.0
+            float sumTY = 0.0
+            for t = 0 to k - 1
+                float yy = array.get(y, start + t)
+                sumT += t
+                sumY += yy
+                sumTT += t * t
+                sumTY += t * yy
+            float denom = k * sumTT - sumT * sumT
+            float b = denom != 0 ? (k * sumTY - sumT * sumY) / denom : 0.0
+            float a = (sumY - b * sumT) / k
+            float sse = 0.0
+            for t = 0 to k - 1
+                float resid = array.get(y, start + t) - (a + b * t)
+                sse += resid * resid
+            float f2 = math.max(sse / k, 1e-12)
+            sumFq += math.pow(f2, q / 2)
+        float fq = math.pow(sumFq / nseg, 1 / q)
+        if fq > 0
+            array.push(logk, math.log(k))
+            array.push(logf, math.log(fq))
+
+    int m = array.size(logk)
+    float h = na
+    if m >= 2
+        float sx = array.sum(logk)
+        float sy = array.sum(logf)
+        float sxx = 0.0
+        float sxy = 0.0
+        for i = 0 to m - 1
+            float xx = array.get(logk, i)
+            float yy = array.get(logf, i)
+            sxx += xx * xx
+            sxy += xx * yy
+        float d = m * sxx - sx * sx
+        h := d != 0 ? (m * sxy - sx * sy) / d : na
+    h
+
+// ============================ Estimation ============================
+var float hLow = na
+var float h2 = na
+var float hHigh = na
+
+bool doCalc = (bar_index % recalcEvery == 0) or barstate.islast
+
+if doCalc and bar_index >= lookback + rvWindow + lvLag
+    float[] lvArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        array.set(lvArr, i, lv[lookback - 1 - i])
+    hLow := f_mfdfa(lvArr, lookback, qLow)
+    h2 := f_mfdfa(lvArr, lookback, 2.0)
+    hHigh := f_mfdfa(lvArr, lookback, qHigh)
+
+// ============================ Plots ============================
+plot(h2, title = "h(2) — classic Hurst of log-vol increments", color = #2962FF, linewidth = 2)
+plot(hLow, title = "h(q low) — small-fluctuation weighting", color = #26A69A, linewidth = 1)
+plot(hHigh, title = "h(q high) — large-fluctuation weighting", color = #EF5350, linewidth = 1)
+plot(lv, title = "Log-volatility increment (LV) — raw", display = display.data_window)
+
+hline(0.5, "h = 0.5 (random walk / roughness boundary)", color = showRefLines ? color.new(color.gray, 40) : na, linestyle = hline.style_dashed)
+
+// ============================ Alerts ============================
+alertcondition(ta.crossunder(h2, 0.5), title = "Log-volatility turns rough (h(2)<0.5)",
+     message = "Generalized Hurst exponent h(2) of the log-volatility increments crossed below 0.5: volatility changes are becoming anti-persistent/rough (Takaishi, 2019).")
+alertcondition(ta.crossover(h2, 0.5), title = "Log-volatility turns persistent (h(2)>0.5)",
+     message = "Generalized Hurst exponent h(2) of the log-volatility increments crossed above 0.5: volatility changes are becoming persistent.")
+
+// ============================ Summary table ============================
+var table infoTable = table.new(position.top_right, 2, 7, border_width = 1)
+
+if barstate.islast and showTable
+    float deltaH = hLow - hHigh
+    bool isRough = not na(h2) and h2 < 0.5
+    bool isMultifractal = not na(deltaH) and deltaH > 0.15
+
+    table.cell(infoTable, 0, 0, "Rough Volatility (Takaishi 2019)", bgcolor = color.new(color.gray, 70), text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, "", bgcolor = color.new(color.gray, 70))
+
+    table.cell(infoTable, 0, 1, "h(q low)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, str.tostring(hLow, "#.####"))
+
+    table.cell(infoTable, 0, 2, "h(2) — classic Hurst", text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, str.tostring(h2, "#.####"),
+         text_color = na(h2) ? color.gray : h2 < 0.5 ? color.red : color.green)
+
+    table.cell(infoTable, 0, 3, "h(q high)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, str.tostring(hHigh, "#.####"))
+
+    table.cell(infoTable, 0, 4, "Δh = h(qLow) - h(qHigh)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 4, str.tostring(deltaH, "#.####"))
+
+    table.cell(infoTable, 0, 5, "Rough (h(2)<0.5)?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 5, na(h2) ? "n/a" : isRough ? "Yes" : "No")
+
+    table.cell(infoTable, 0, 6, "Multifractal (Δh>0.15)?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 6, na(deltaH) ? "n/a" : isMultifractal ? "Yes" : "No (weak/none)")
