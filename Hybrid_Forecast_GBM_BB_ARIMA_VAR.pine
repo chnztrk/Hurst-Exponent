@@ -1,0 +1,362 @@
+//@version=6
+// Hybrid forecasting: GBM + Brownian Bridge Monte Carlo simulation, plus a
+// fixed-order ARIMA(p,1,0) and a simplified VAR(1), projected forward from
+// the current bar. Adapted from Celik & Celik (2025), "Hybrid forecasting of
+// agricultural commodity prices: Integrating machine learning, time series,
+// and stochastic simulation models", Borsa Istanbul Review.
+// FBM and LSTM are intentionally excluded: FBM's exact simulation (Cholesky
+// decomposition of an NxN covariance matrix per path) is too expensive to
+// recompute live in Pine for a meaningful path count/horizon, and LSTM
+// requires externally trained weights via backpropagation, which Pine cannot
+// do. A classical R/S Hurst exponent (the paper's Table 6 input for choosing
+// GBM vs FBM) is still reported for context, but — since FBM is out of
+// scope — it does not drive any of the simulations here.
+// Unlike the paper's backtested MAPE/RMSE (comparing forecasts to already-
+// known historical outcomes), this indicator projects genuinely forward from
+// the chart's last bar, so only forward-looking metrics (VaR90, average
+// return, Sharpe) are reported — there is no future ground truth yet to
+// score accuracy against.
+indicator("Hybrid Monte Carlo Forecast: GBM+BB+ARIMA+VAR [Celik & Celik 2025]", shorttitle = "Hybrid Forecast", overlay = true, max_bars_back = 5000)
+
+// ============================ Inputs ============================
+grpData = "Data & Estimation"
+srcClose = input.source(close, "Source", group = grpData)
+lookback = input.int(252, "Lookback (bars) for μ, σ, R/S H, model fitting", minval = 60, group = grpData)
+
+grpSim = "Simulation"
+horizon = input.int(20, "Forecast horizon (bars ahead)", minval = 5, maxval = 60, group = grpSim)
+nPaths = input.int(200, "Monte Carlo paths (GBM/BB)", minval = 20, maxval = 1000, group = grpSim)
+
+grpARIMA = "ARIMA(p,1,0) / VAR(1)"
+arOrder = input.int(5, "ARIMA AR order p", minval = 1, maxval = 10, group = grpARIMA,
+     tooltip = "Differencing order d is fixed at 1, matching the paper's fixed ARIMA(5,1,0) configuration used across all crisis periods for comparability.")
+
+grpDisp = "Display"
+showGBM = input.bool(true, "Show GBM", group = grpDisp)
+showBand = input.bool(true, "Show GBM 5-95% band", group = grpDisp)
+showBB = input.bool(true, "Show Brownian Bridge", group = grpDisp)
+showARIMA = input.bool(true, "Show ARIMA(p,1,0)", group = grpDisp)
+showVAR = input.bool(true, "Show VAR(1)", group = grpDisp)
+showTable = input.bool(true, "Show summary table", group = grpDisp)
+colorGBM = input.color(#2962FF, "GBM color", group = grpDisp)
+colorBB = input.color(#AB47BC, "Brownian Bridge color", group = grpDisp)
+colorARIMA = input.color(#FF6D00, "ARIMA color", group = grpDisp)
+colorVAR = input.color(#26A69A, "VAR color", group = grpDisp)
+
+// ============================ Gaussian RNG (Box-Muller) ============================
+f_gauss() =>
+    float u1 = math.random(0.0000001, 1.0)
+    float u2 = math.random(0.0, 1.0)
+    math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
+
+// ============================ Classical R/S Hurst exponent (informational only) ============================
+f_rs(float[] logret, int n) =>
+    int[] scales = array.new<int>()
+    int kk = 8
+    while kk <= n / 2
+        array.push(scales, kk)
+        kk *= 2
+
+    float[] logn = array.new<float>()
+    float[] logrs = array.new<float>()
+    for si = 0 to array.size(scales) - 1
+        int s = array.get(scales, si)
+        int nseg = n / s
+        float sumRS = 0.0
+        int cnt = 0
+        for seg = 0 to nseg - 1
+            int start = seg * s
+            float segMean = 0.0
+            for t = 0 to s - 1
+                segMean += array.get(logret, start + t)
+            segMean := segMean / s
+            float cum = 0.0
+            float maxC = -1e18
+            float minC = 1e18
+            float sse = 0.0
+            for t = 0 to s - 1
+                float v = array.get(logret, start + t) - segMean
+                cum += v
+                maxC := math.max(maxC, cum)
+                minC := math.min(minC, cum)
+                sse += v * v
+            float rng = maxC - minC
+            float sd = math.sqrt(sse / s)
+            if sd > 0
+                sumRS += rng / sd
+                cnt += 1
+        if cnt > 0
+            float avgRS = sumRS / cnt
+            if avgRS > 0
+                array.push(logn, math.log(s))
+                array.push(logrs, math.log(avgRS))
+
+    int m = array.size(logn)
+    float H = na
+    if m >= 2
+        float sx = array.sum(logn)
+        float sy = array.sum(logrs)
+        float sxx = 0.0
+        float sxy = 0.0
+        for i = 0 to m - 1
+            float xx = array.get(logn, i)
+            float yy = array.get(logrs, i)
+            sxx += xx * xx
+            sxy += xx * yy
+        float dd = m * sxx - sx * sx
+        H := dd != 0 ? (m * sxy - sx * sy) / dd : na
+    H
+
+// ============================ Build chart points for a polyline ============================
+f_buildPoints(float[] vals, int startBar, int hz) =>
+    array<chart.point> pts = array.new<chart.point>()
+    for t = 0 to hz
+        array.push(pts, chart.point.from_index(startBar + t, array.get(vals, t)))
+    pts
+
+// ============================ Persistent drawing objects ============================
+var polyline gbmMeanLine = na
+var polyline gbmUpperLine = na
+var polyline gbmLowerLine = na
+var polyline bbMeanLine = na
+var polyline arimaLine = na
+var polyline varLine = na
+var table infoTable = table.new(position.top_right, 2, 13, border_width = 1)
+
+if barstate.islast
+    // ---------- Historical arrays ----------
+    float[] closesArr = array.new<float>(lookback + 1)
+    for i = 0 to lookback
+        array.set(closesArr, i, srcClose[lookback - i])
+
+    float[] logRetArr = array.new<float>(lookback)
+    float[] diffsArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        float c0 = array.get(closesArr, i)
+        float c1 = array.get(closesArr, i + 1)
+        array.set(logRetArr, i, math.log(c1 / c0))
+        array.set(diffsArr, i, c1 - c0)
+
+    float lastPrice = array.get(closesArr, lookback)
+    float mu = array.avg(logRetArr)
+    float sigma = array.stdev(logRetArr)
+    float rsH = f_rs(logRetArr, lookback)
+
+    // ---------- GBM Monte Carlo (Eq. 2 in the paper) ----------
+    matrix<float> gbmMat = matrix.new<float>(nPaths, horizon + 1)
+    for i = 0 to nPaths - 1
+        matrix.set(gbmMat, i, 0, lastPrice)
+        float prev = lastPrice
+        for t = 1 to horizon
+            float z = f_gauss()
+            float newP = prev * math.exp((mu - sigma * sigma / 2.0) + sigma * z)
+            matrix.set(gbmMat, i, t, newP)
+            prev := newP
+
+    // ---------- Brownian Bridge Monte Carlo (Eq. 8 in the paper) ----------
+    matrix<float> bbMat = matrix.new<float>(nPaths, horizon + 1)
+    for i = 0 to nPaths - 1
+        float[] incr = array.new<float>(horizon)
+        float total = 0.0
+        for t = 0 to horizon - 1
+            float z = f_gauss()
+            array.set(incr, t, z)
+            total += z
+        matrix.set(bbMat, i, 0, lastPrice)
+        float cum2 = 0.0
+        for t = 1 to horizon
+            cum2 += array.get(incr, t - 1)
+            float frac = (t * 1.0) / horizon
+            float val = lastPrice + cum2 - frac * total
+            matrix.set(bbMat, i, t, val)
+
+    // ---------- GBM path stats (mean + 5-95% band) ----------
+    float[] gbmMean = array.new<float>(horizon + 1)
+    float[] gbmUpper = array.new<float>(horizon + 1)
+    float[] gbmLower = array.new<float>(horizon + 1)
+    for t = 0 to horizon
+        float[] colArr = matrix.col(gbmMat, t)
+        array.set(gbmMean, t, array.avg(colArr))
+        array.set(gbmUpper, t, array.percentile_linear_interpolation(colArr, 95))
+        array.set(gbmLower, t, array.percentile_linear_interpolation(colArr, 5))
+
+    float[] bbMean = array.new<float>(horizon + 1)
+    for t = 0 to horizon
+        float[] colArr2 = matrix.col(bbMat, t)
+        array.set(bbMean, t, array.avg(colArr2))
+
+    // ---------- GBM risk/return metrics (Eq. 19-21 in the paper) ----------
+    float[] gbmTermRet = array.new<float>(nPaths)
+    float gbmSharpeSum = 0.0
+    for i = 0 to nPaths - 1
+        float term = matrix.get(gbmMat, i, horizon)
+        array.set(gbmTermRet, i, (term - lastPrice) / lastPrice)
+        float[] rowArr = matrix.row(gbmMat, i)
+        float[] pathRet = array.new<float>(horizon)
+        for t = 1 to horizon
+            float p0 = array.get(rowArr, t - 1)
+            float p1 = array.get(rowArr, t)
+            array.set(pathRet, t - 1, (p1 - p0) / p0)
+        float mret = array.avg(pathRet)
+        float sret = array.stdev(pathRet)
+        if sret > 0
+            gbmSharpeSum += mret / sret
+    float gbmVaR90 = -1 * array.percentile_linear_interpolation(gbmTermRet, 10) * 100
+    float gbmAvgReturn = array.avg(gbmTermRet) * 100
+    float gbmAvgSharpe = gbmSharpeSum / nPaths
+
+    // ---------- BB risk/return metrics ----------
+    float[] bbTermRet = array.new<float>(nPaths)
+    float bbSharpeSum = 0.0
+    for i = 0 to nPaths - 1
+        float term2 = matrix.get(bbMat, i, horizon)
+        array.set(bbTermRet, i, (term2 - lastPrice) / lastPrice)
+        float[] rowArr2 = matrix.row(bbMat, i)
+        float[] pathRet2 = array.new<float>(horizon)
+        for t = 1 to horizon
+            float p0b = array.get(rowArr2, t - 1)
+            float p1b = array.get(rowArr2, t)
+            array.set(pathRet2, t - 1, (p1b - p0b) / p0b)
+        float mret2 = array.avg(pathRet2)
+        float sret2 = array.stdev(pathRet2)
+        if sret2 > 0
+            bbSharpeSum += mret2 / sret2
+    float bbVaR90 = -1 * array.percentile_linear_interpolation(bbTermRet, 10) * 100
+    float bbAvgReturn = array.avg(bbTermRet) * 100
+    float bbAvgSharpe = bbSharpeSum / nPaths
+
+    // ---------- ARIMA(p,1,0) via OLS normal equations on first differences ----------
+    int nObs = lookback - arOrder
+    matrix<float> Xm = matrix.new<float>(nObs, arOrder + 1)
+    matrix<float> Ym = matrix.new<float>(nObs, 1)
+    for row = 0 to nObs - 1
+        int t = row + arOrder
+        matrix.set(Xm, row, 0, 1.0)
+        for k = 1 to arOrder
+            matrix.set(Xm, row, k, array.get(diffsArr, t - k))
+        matrix.set(Ym, row, 0, array.get(diffsArr, t))
+    matrix<float> Xt = matrix.transpose(Xm)
+    matrix<float> XtX = matrix.mult(Xt, Xm)
+    matrix<float> XtY = matrix.mult(Xt, Ym)
+    matrix<float> XtXinv = matrix.inv(XtX)
+
+    bool arimaOk = not na(XtXinv)
+    float[] arimaPath = array.new<float>(horizon + 1)
+    float arimaReturn = na
+    if arimaOk
+        matrix<float> betaM = matrix.mult(XtXinv, XtY)
+        float[] betaArr = array.new<float>(arOrder + 1)
+        for k = 0 to arOrder
+            array.set(betaArr, k, matrix.get(betaM, k, 0))
+        float[] lagBuf = array.new<float>(arOrder)
+        for k = 0 to arOrder - 1
+            array.set(lagBuf, k, array.get(diffsArr, lookback - 1 - k))
+        array.set(arimaPath, 0, lastPrice)
+        float prevP = lastPrice
+        for t = 1 to horizon
+            float dHat = array.get(betaArr, 0)
+            for k = 1 to arOrder
+                dHat += array.get(betaArr, k) * array.get(lagBuf, k - 1)
+            float newP = prevP + dHat
+            array.set(arimaPath, t, newP)
+            prevP := newP
+            for k = arOrder - 1 to 1 by -1
+                array.set(lagBuf, k, array.get(lagBuf, k - 1))
+            array.set(lagBuf, 0, dHat)
+        arimaReturn := (array.get(arimaPath, horizon) - lastPrice) / lastPrice * 100
+
+    // ---------- VAR(1): simplified bivariate OLS on price levels ----------
+    float mx = 0.0
+    float my = 0.0
+    for i = 0 to lookback - 1
+        mx += array.get(closesArr, i)
+        my += array.get(closesArr, i + 1)
+    mx := mx / lookback
+    my := my / lookback
+    float sxy2 = 0.0
+    float sxx2 = 0.0
+    for i = 0 to lookback - 1
+        float xv = array.get(closesArr, i) - mx
+        float yv = array.get(closesArr, i + 1) - my
+        sxy2 += xv * yv
+        sxx2 += xv * xv
+    bool varOk = sxx2 != 0
+    float[] varPath = array.new<float>(horizon + 1)
+    float varReturn = na
+    if varOk
+        float slope = sxy2 / sxx2
+        float intercept = my - slope * mx
+        array.set(varPath, 0, lastPrice)
+        float prevV = lastPrice
+        for t = 1 to horizon
+            float newV = intercept + slope * prevV
+            array.set(varPath, t, newV)
+            prevV := newV
+        varReturn := (array.get(varPath, horizon) - lastPrice) / lastPrice * 100
+
+    // ---------- Draw forecast cones ----------
+    if not na(gbmMeanLine)
+        polyline.delete(gbmMeanLine)
+    if not na(gbmUpperLine)
+        polyline.delete(gbmUpperLine)
+    if not na(gbmLowerLine)
+        polyline.delete(gbmLowerLine)
+    if not na(bbMeanLine)
+        polyline.delete(bbMeanLine)
+    if not na(arimaLine)
+        polyline.delete(arimaLine)
+    if not na(varLine)
+        polyline.delete(varLine)
+
+    if showGBM
+        gbmMeanLine := polyline.new(points = f_buildPoints(gbmMean, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorGBM, line_width = 2)
+    if showGBM and showBand
+        gbmUpperLine := polyline.new(points = f_buildPoints(gbmUpper, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = color.new(colorGBM, 60), line_width = 1)
+        gbmLowerLine := polyline.new(points = f_buildPoints(gbmLower, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = color.new(colorGBM, 60), line_width = 1)
+    if showBB
+        bbMeanLine := polyline.new(points = f_buildPoints(bbMean, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorBB, line_width = 2)
+    if showARIMA and arimaOk
+        arimaLine := polyline.new(points = f_buildPoints(arimaPath, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorARIMA, line_width = 2)
+    if showVAR and varOk
+        varLine := polyline.new(points = f_buildPoints(varPath, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorVAR, line_width = 2)
+
+    // ---------- Summary table ----------
+    if showTable
+        table.cell(infoTable, 0, 0, "Hybrid Forecast (Celik & Celik 2025)", bgcolor = color.new(color.gray, 70), text_color = color.white, text_halign = text.align_left)
+        table.cell(infoTable, 1, 0, "", bgcolor = color.new(color.gray, 70))
+
+        table.cell(infoTable, 0, 1, "μ (daily log-return)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 1, str.tostring(mu, "#.######"))
+
+        table.cell(infoTable, 0, 2, "σ (daily log-return)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 2, str.tostring(sigma, "#.######"))
+
+        table.cell(infoTable, 0, 3, "R/S Hurst (informational)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 3, str.tostring(rsH, "#.####"))
+
+        table.cell(infoTable, 0, 4, "GBM VaR90 (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 4, str.tostring(gbmVaR90, "#.##"))
+
+        table.cell(infoTable, 0, 5, "GBM Avg Return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 5, str.tostring(gbmAvgReturn, "#.##"))
+
+        table.cell(infoTable, 0, 6, "GBM Avg Sharpe", text_halign = text.align_left)
+        table.cell(infoTable, 1, 6, str.tostring(gbmAvgSharpe, "#.###"))
+
+        table.cell(infoTable, 0, 7, "BB VaR90 (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 7, str.tostring(bbVaR90, "#.##"))
+
+        table.cell(infoTable, 0, 8, "BB Avg Return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 8, str.tostring(bbAvgReturn, "#.##"))
+
+        table.cell(infoTable, 0, 9, "BB Avg Sharpe", text_halign = text.align_left)
+        table.cell(infoTable, 1, 9, str.tostring(bbAvgSharpe, "#.###"))
+
+        table.cell(infoTable, 0, 10, "ARIMA(p,1,0) return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
+
+        table.cell(infoTable, 0, 11, "VAR(1) return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 11, varOk ? str.tostring(varReturn, "#.##") : "n/a")
+
+        table.cell(infoTable, 0, 12, "Horizon (bars)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 12, str.tostring(horizon))
