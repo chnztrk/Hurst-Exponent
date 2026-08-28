@@ -1,0 +1,82 @@
+//@version=6
+// Power-law tail exponent (α) — the "Noah effect" (discontinuity) half of
+// Grobys (2023)'s multifractal asset (in)variance model. Standalone,
+// full-precision, own-pane companion to MMAR_Hurst_Exponent.pine — add both
+// to a chart to get two independently auto-scaled panes instead of one
+// shared/normalized pane.
+indicator("MMAR Power-law Exponent (α) [Grobys 2023]", shorttitle = "MMAR Alpha (α)", overlay = false, max_bars_back = 5000, precision = 4)
+
+// ============================ Inputs ============================
+grpRV = "Realized Variance"
+srcClose = input.source(close, "Source", group = grpRV)
+rvWindow = input.int(5, "RV aggregation (bars)", minval = 1, group = grpRV,
+     tooltip = "Number of bars whose squared returns are summed into one realized-variance observation. 5 ≈ weekly, 20 ≈ monthly in the paper.")
+
+grpEst = "Estimation Window"
+lookback = input.int(256, "Lookback (# RV observations)", minval = 32, group = grpEst,
+     tooltip = "Number of realized-variance observations used to estimate α. Should be a power of two (N ∈ 2^k).")
+recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst)
+tailFraction = input.float(0.20, "Power-law tail fraction", minval = 0.02, maxval = 0.5, step = 0.01, group = grpEst,
+     tooltip = "Approximates z_min as the top X% of the window. The paper instead selects z_min by Kolmogorov-Smirnov minimization (Clauset et al., 2009); this is a fast proxy for live charting.")
+
+grpBench = "Paper Benchmark (Tables 1-4)"
+cascadePreset = input.string("p=0.60 (paper baseline — FX/crypto)", "Benchmark cascade",
+     options = ["p=0.55 (mild)", "p=0.60 (paper baseline — FX/crypto)", "p=0.65", "p=0.70 (extreme — commodities/equities)"], group = grpBench)
+showBenchmark = input.bool(true, "Show benchmark band", group = grpBench)
+showRefLines = input.bool(true, "Show α=2 (mean undefined) / α=3 (var. of var. undefined) lines", group = grpBench)
+
+// ============================ Realized variance (Eq. 2-3) ============================
+logRet = math.log(srcClose / srcClose[1])
+rv = math.sum(logRet * logRet, rvWindow)
+
+// ============================ Tail exponent (Hill / Clauset-Shalizi-Newman MLE, Eq. 8) ============================
+f_powerlaw(float[] z, int n, float q) =>
+    float[] sorted = array.copy(z)
+    array.sort(sorted, order.descending)
+    int ntail = math.max(int(math.round(n * q)), 5)
+    float zmin = array.get(sorted, ntail - 1)
+    float sumLog = 0.0
+    for i = 0 to ntail - 1
+        sumLog += math.log(array.get(sorted, i) / zmin)
+    float alpha = sumLog > 0 ? 1.0 + ntail / sumLog : na
+    [alpha, zmin]
+
+// ============================ Estimation ============================
+var float alphaVal = na
+var float zminVal = na
+bool doCalc = (bar_index % recalcEvery == 0) or barstate.islast
+
+if doCalc and bar_index >= lookback + rvWindow
+    float[] zArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        array.set(zArr, i, rv[lookback - 1 - i])
+    [a, zm] = f_powerlaw(zArr, lookback, tailFraction)
+    alphaVal := a
+    zminVal := zm
+
+// ============================ Benchmark cascade lookup (Tables 1-4, α column) ============================
+float benchAlphaLo = 2.0965
+float benchAlphaHi = 3.2911
+if cascadePreset == "p=0.55 (mild)"
+    benchAlphaLo := 2.8678
+    benchAlphaHi := 4.9739
+else if cascadePreset == "p=0.65"
+    benchAlphaLo := 1.7809
+    benchAlphaHi := 2.6639
+else if cascadePreset == "p=0.70 (extreme — commodities/equities)"
+    benchAlphaLo := 1.5796
+    benchAlphaHi := 2.2343
+
+// ============================ Plot ============================
+plot(alphaVal, title = "Power-law Exponent (α)", color = #FF6D00, linewidth = 2)
+plot(zminVal, title = "z_min (tail cutoff)", display = display.data_window)
+
+hline(2.0, "α = 2 (mean undefined below)", color = showRefLines ? color.new(color.red, 40) : na, linestyle = hline.style_dashed)
+hline(3.0, "α = 3 (variance of variance undefined below)", color = showRefLines ? color.new(color.red, 60) : na, linestyle = hline.style_dotted)
+hline(benchAlphaLo, "Benchmark α 5%", color = showBenchmark ? color.new(#FF6D00, 70) : na, linestyle = hline.style_dotted)
+hline(benchAlphaHi, "Benchmark α 95%", color = showBenchmark ? color.new(#FF6D00, 70) : na, linestyle = hline.style_dotted)
+
+alertcondition(ta.crossunder(alphaVal, 3), title = "Variance of variance breaks down (α<3)",
+     message = "Power-law exponent α crossed below 3: the variance of the realized-variance process is no longer defined (Grobys, 2023).")
+alertcondition(ta.crossunder(alphaVal, 2), title = "Mean of realized variance breaks down (α<2)",
+     message = "Power-law exponent α crossed below 2: extreme tail risk — the expected realized variance itself is no longer defined.")
