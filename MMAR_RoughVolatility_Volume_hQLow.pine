@@ -1,0 +1,130 @@
+//@version=6
+// Generalized Hurst exponent h(q) of trading-VOLUME log-increments, evaluated
+// at a single low (negative) q, via MF-DFA (Kantelhardt et al., 2002). Mirrors
+// MMAR_RoughVolatility_hQLow.pine but applies the same estimator to volume
+// instead of realized volatility, following Takaishi, T. (2026), "Rough time
+// series in Bitcoin trade counts and trading volume", which finds that trading
+// volume (and trade counts) share the same rough (h<0.5), historically-
+// declining-multifractality dynamics as realized volatility — evidence for
+// the mixture-of-distributions hypothesis (volatility and activity are driven
+// by the same underlying information-flow process). Trade counts are not
+// available as a built-in TradingView series, so this uses volume, the
+// series the paper finds most similar to RV's dynamics (PCC=0.828 vs 0.557
+// for trade counts).
+indicator("MMAR Rough Volume h(qLow) [Takaishi 2026]", shorttitle = "MMAR Vol h(qLow)", overlay = false, max_bars_back = 5000, precision = 4)
+
+// ============================ Inputs ============================
+grpVol = "Volume Aggregation"
+volWindow = input.int(5, "Volume aggregation (bars)", minval = 1, group = grpVol,
+     tooltip = "Bars summed into one volume observation before taking logs. 5 ≈ weekly, 20 ≈ monthly.")
+ivLag = input.int(5, "Log-volume increment lag (Δ, bars)", minval = 1, group = grpVol,
+     tooltip = "IV_t = log(sum(volume,volWindow)_t) - log(sum(volume,volWindow)_(t-Δ)). Set equal to the aggregation window for a like-for-like period-over-period comparison.")
+
+grpEst = "Estimation Window"
+lookback = input.int(256, "Lookback (# IV observations)", minval = 32, group = grpEst,
+     tooltip = "Number of log-volume-increment observations used to estimate h(q) via MF-DFA. Should be a power of two (N ∈ 2^k).")
+recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst)
+q = input.float(-3.0, "q (small-fluctuation weight)", maxval = -0.5, group = grpEst,
+     tooltip = "Negative q emphasizes small fluctuations. Keep away from 0 to avoid the 1/q singularity.")
+showRefLine = input.bool(true, "Show h=0.5 (random walk / roughness boundary) line")
+showTable = input.bool(true, "Show summary table")
+
+// ============================ Log-volume increments ============================
+volSum = math.sum(volume, volWindow)
+logVolAgg = math.log(math.max(volSum, 1e-8))
+iv = logVolAgg - logVolAgg[ivLag]
+
+// ============================ Generalized MF-DFA h(q) — Kantelhardt et al. (2002), Eq. 4-8 ============================
+f_mfdfa(float[] z, int n, float q) =>
+    float[] y = array.new<float>(n)
+    float mZ = array.avg(z)
+    float cum = 0.0
+    for i = 0 to n - 1
+        cum += array.get(z, i) - mZ
+        array.set(y, i, cum)
+
+    int[] scales = array.new<int>()
+    int kk = 4
+    while kk <= n / 2
+        array.push(scales, kk)
+        kk *= 2
+
+    float[] logk = array.new<float>()
+    float[] logf = array.new<float>()
+    for si = 0 to array.size(scales) - 1
+        int k = array.get(scales, si)
+        int nseg = n / k
+        float sumFq = 0.0
+        for seg = 0 to nseg - 1
+            int start = seg * k
+            float sumT = 0.0
+            float sumY = 0.0
+            float sumTT = 0.0
+            float sumTY = 0.0
+            for t = 0 to k - 1
+                float yy = array.get(y, start + t)
+                sumT += t
+                sumY += yy
+                sumTT += t * t
+                sumTY += t * yy
+            float denom = k * sumTT - sumT * sumT
+            float b = denom != 0 ? (k * sumTY - sumT * sumY) / denom : 0.0
+            float a = (sumY - b * sumT) / k
+            float sse = 0.0
+            for t = 0 to k - 1
+                float resid = array.get(y, start + t) - (a + b * t)
+                sse += resid * resid
+            float f2 = math.max(sse / k, 1e-12)
+            sumFq += math.pow(f2, q / 2)
+        float fq = math.pow(sumFq / nseg, 1 / q)
+        if fq > 0
+            array.push(logk, math.log(k))
+            array.push(logf, math.log(fq))
+
+    int m = array.size(logk)
+    float h = na
+    if m >= 2
+        float sx = array.sum(logk)
+        float sy = array.sum(logf)
+        float sxx = 0.0
+        float sxy = 0.0
+        for i = 0 to m - 1
+            float xx = array.get(logk, i)
+            float yy = array.get(logf, i)
+            sxx += xx * xx
+            sxy += xx * yy
+        float d = m * sxx - sx * sx
+        h := d != 0 ? (m * sxy - sx * sy) / d : na
+    h
+
+// ============================ Estimation ============================
+var float hQLow = na
+bool doCalc = (bar_index % recalcEvery == 0) or barstate.islast
+
+if doCalc and bar_index >= lookback + volWindow + ivLag
+    float[] ivArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        array.set(ivArr, i, iv[lookback - 1 - i])
+    hQLow := f_mfdfa(ivArr, lookback, q)
+
+// ============================ Plot ============================
+plot(hQLow, title = "h(qLow) — trading volume", color = #AB47BC, linewidth = 2)
+
+hline(0.5, "h = 0.5 (random walk / roughness boundary)", color = showRefLine ? color.new(color.gray, 40) : na, linestyle = hline.style_dashed)
+
+// ============================ Alerts ============================
+alertcondition(ta.crossunder(hQLow, 0.5), title = "Volume h(qLow) turns rough (<0.5)",
+     message = "h(qLow) of log-volume increments crossed below 0.5: trading-volume changes are becoming anti-persistent/rough (Takaishi, 2026).")
+alertcondition(ta.crossover(hQLow, 0.5), title = "Volume h(qLow) turns persistent (>0.5)",
+     message = "h(qLow) of log-volume increments crossed above 0.5: trading-volume changes are becoming persistent.")
+
+// ============================ Summary table ============================
+var table infoTable = table.new(position.top_right, 2, 2, border_width = 1)
+
+if barstate.islast and showTable
+    table.cell(infoTable, 0, 0, "h(qLow) — Volume", text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, str.tostring(hQLow, "#.####"),
+         text_color = na(hQLow) ? color.gray : hQLow < 0.5 ? color.red : color.green)
+
+    table.cell(infoTable, 0, 1, "Rough (h<0.5)?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, na(hQLow) ? "n/a" : hQLow < 0.5 ? "Yes" : "No")
