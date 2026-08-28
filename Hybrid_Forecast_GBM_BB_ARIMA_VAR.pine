@@ -260,7 +260,7 @@ if barstate.islast
             float newP = prevP + dHat
             array.set(arimaPath, t, newP)
             prevP := newP
-            for k = arOrder - 1 to 1 by -1
+            for k = arOrder - 1 to 1
                 array.set(lagBuf, k, array.get(lagBuf, k - 1))
             array.set(lagBuf, 0, dHat)
         arimaReturn := (array.get(arimaPath, horizon) - lastPrice) / lastPrice * 100
