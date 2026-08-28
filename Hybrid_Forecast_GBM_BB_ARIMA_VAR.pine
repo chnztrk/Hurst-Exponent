@@ -1,7 +1,7 @@
 //@version=6
 // Hybrid forecasting: GBM + Brownian Bridge Monte Carlo simulation, plus a
-// fixed-order ARIMA(p,1,0) and a simplified VAR(1), projected forward from
-// the current bar. Adapted from Celik & Celik (2025), "Hybrid forecasting of
+// fixed-order ARIMA(p,1,0) and a VAR-X(1), projected forward from the
+// current bar. Adapted from Celik & Celik (2025), "Hybrid forecasting of
 // agricultural commodity prices: Integrating machine learning, time series,
 // and stochastic simulation models", Borsa Istanbul Review.
 // FBM and LSTM are intentionally excluded: FBM's exact simulation (Cholesky
@@ -16,6 +16,14 @@
 // the chart's last bar, so only forward-looking metrics (VaR90, average
 // return, Sharpe) are reported — there is no future ground truth yet to
 // score accuracy against.
+// VAR-X extension: following Do (2026), "Maturation of Bitcoin market
+// microstructure" (VAR-X with VIX as an exogenous control), the plain
+// VAR(1) is extended with lagged open interest as an exogenous regressor
+// when the symbol reports it (mainly perpetual/futures contracts) — a
+// proxy for aggregate long/short positioning, since Pine cannot fetch an
+// external long/short-ratio API directly. Correlation between open
+// interest and price is reported so the added regressor's relevance can
+// be judged rather than assumed.
 indicator("Hybrid Monte Carlo Forecast: GBM+BB+ARIMA+VAR [Celik & Celik 2025]", shorttitle = "Hybrid Forecast", overlay = true, max_bars_back = 5000)
 
 // ============================ Inputs ============================
@@ -27,16 +35,18 @@ grpSim = "Simulation"
 horizon = input.int(20, "Forecast horizon (bars ahead)", minval = 5, maxval = 60, group = grpSim)
 nPaths = input.int(200, "Monte Carlo paths (GBM/BB)", minval = 20, maxval = 1000, group = grpSim)
 
-grpARIMA = "ARIMA(p,1,0) / VAR(1)"
+grpARIMA = "ARIMA(p,1,0) / VAR-X(1)"
 arOrder = input.int(5, "ARIMA AR order p", minval = 1, maxval = 10, group = grpARIMA,
      tooltip = "Differencing order d is fixed at 1, matching the paper's fixed ARIMA(5,1,0) configuration used across all crisis periods for comparability.")
+useOI = input.bool(true, "Use open interest as VAR-X exogenous regressor", group = grpARIMA,
+     tooltip = "Extends VAR(1) into VAR-X(1) by adding lagged open interest as a second predictor (a positioning/crowding proxy, since Pine cannot fetch an external long/short-ratio feed). Falls back to plain VAR(1) automatically if the symbol does not report open interest (typical for spot pairs).")
 
 grpDisp = "Display"
 showGBM = input.bool(true, "Show GBM", group = grpDisp)
 showBand = input.bool(true, "Show GBM 5-95% band", group = grpDisp)
 showBB = input.bool(true, "Show Brownian Bridge", group = grpDisp)
 showARIMA = input.bool(true, "Show ARIMA(p,1,0)", group = grpDisp)
-showVAR = input.bool(true, "Show VAR(1)", group = grpDisp)
+showVAR = input.bool(true, "Show VAR-X(1)", group = grpDisp)
 showTable = input.bool(true, "Show summary table", group = grpDisp)
 colorGBM = input.color(#2962FF, "GBM color", group = grpDisp)
 colorBB = input.color(#AB47BC, "Brownian Bridge color", group = grpDisp)
@@ -114,6 +124,13 @@ f_buildPoints(float[] vals, int startBar, int hz) =>
         array.push(pts, chart.point.from_index(startBar + t, array.get(vals, t)))
     pts
 
+// ============================ Open interest correlation (must run every bar) ============================
+// ta.* functions maintain rolling state across bars, so they must be called
+// unconditionally here rather than inside the barstate.islast block below,
+// or they would not have "seen" the prior bars and would return wrong values.
+float oiCorrLevel = ta.correlation(open_interest, srcClose, lookback)
+float oiCorrChange = ta.correlation(ta.change(open_interest), ta.change(srcClose), lookback)
+
 // ============================ Persistent drawing objects ============================
 var polyline gbmMeanLine = na
 var polyline gbmUpperLine = na
@@ -121,7 +138,7 @@ var polyline gbmLowerLine = na
 var polyline bbMeanLine = na
 var polyline arimaLine = na
 var polyline varLine = na
-var table infoTable = table.new(position.top_right, 2, 13, border_width = 1)
+var table infoTable = table.new(position.top_right, 2, 16, border_width = 1)
 
 if barstate.islast
     // ---------- Historical arrays ----------
@@ -265,31 +282,47 @@ if barstate.islast
             array.set(lagBuf, 0, dHat)
         arimaReturn := (array.get(arimaPath, horizon) - lastPrice) / lastPrice * 100
 
-    // ---------- VAR(1): simplified bivariate OLS on price levels ----------
-    float mx = 0.0
-    float my = 0.0
+    // ---------- VAR-X(1): price level regressed on its own lag, plus lagged ----------
+    // open interest as an exogenous regressor when available and enabled.
+    bool oiOk = not na(open_interest)
+    bool useOIeff = oiOk and useOI
+    float[] oiArr = array.new<float>(lookback + 1)
+    if useOIeff
+        for i = 0 to lookback
+            array.set(oiArr, i, open_interest[lookback - i])
+
+    int nColsV = useOIeff ? 3 : 2
+    matrix<float> Xv = matrix.new<float>(lookback, nColsV)
+    matrix<float> Yv = matrix.new<float>(lookback, 1)
     for i = 0 to lookback - 1
-        mx += array.get(closesArr, i)
-        my += array.get(closesArr, i + 1)
-    mx := mx / lookback
-    my := my / lookback
-    float sxy2 = 0.0
-    float sxx2 = 0.0
-    for i = 0 to lookback - 1
-        float xv = array.get(closesArr, i) - mx
-        float yv = array.get(closesArr, i + 1) - my
-        sxy2 += xv * yv
-        sxx2 += xv * xv
-    bool varOk = sxx2 != 0
+        matrix.set(Xv, i, 0, 1.0)
+        matrix.set(Xv, i, 1, array.get(closesArr, i))
+        if useOIeff
+            matrix.set(Xv, i, 2, array.get(oiArr, i))
+        matrix.set(Yv, i, 0, array.get(closesArr, i + 1))
+    matrix<float> Xtv = matrix.transpose(Xv)
+    matrix<float> XtXv = matrix.mult(Xtv, Xv)
+    matrix<float> XtYv = matrix.mult(Xtv, Yv)
+    matrix<float> XtXvInv = matrix.inv(XtXv)
+
+    bool varOk = not na(XtXvInv)
     float[] varPath = array.new<float>(horizon + 1)
     float varReturn = na
     if varOk
-        float slope = sxy2 / sxx2
-        float intercept = my - slope * mx
+        matrix<float> betaV = matrix.mult(XtXvInv, XtYv)
+        float aC = matrix.get(betaV, 0, 0)
+        float bC = matrix.get(betaV, 1, 0)
+        float cC = useOIeff ? matrix.get(betaV, 2, 0) : 0.0
+        float lastOI = useOIeff ? array.get(oiArr, lookback) : na
         array.set(varPath, 0, lastPrice)
         float prevV = lastPrice
         for t = 1 to horizon
-            float newV = intercept + slope * prevV
+            // Open interest itself is held at its last observed value over
+            // the forecast horizon (no separate model is fit for its own
+            // future path) — a common simplifying treatment for exogenous
+            // regressors, mirroring how the microstructure paper's VAR-X
+            // holds event dummies/VIX as given rather than forecasting them.
+            float newV = aC + bC * prevV + (useOIeff ? cC * lastOI : 0.0)
             array.set(varPath, t, newV)
             prevV := newV
         varReturn := (array.get(varPath, horizon) - lastPrice) / lastPrice * 100
@@ -355,8 +388,17 @@ if barstate.islast
         table.cell(infoTable, 0, 10, "ARIMA(p,1,0) return (%)", text_halign = text.align_left)
         table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
 
-        table.cell(infoTable, 0, 11, "VAR(1) return (%)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 11, varOk ? str.tostring(varReturn, "#.##") : "n/a")
+        table.cell(infoTable, 0, 11, "Open interest available?", text_halign = text.align_left)
+        table.cell(infoTable, 1, 11, oiOk ? "Yes" : "No (spot symbol?)")
 
-        table.cell(infoTable, 0, 12, "Horizon (bars)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 12, str.tostring(horizon))
+        table.cell(infoTable, 0, 12, "Corr(OI, Price)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 12, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
+
+        table.cell(infoTable, 0, 13, "Corr(ΔOI, ΔPrice)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 13, oiOk ? str.tostring(oiCorrChange, "#.###") : "n/a")
+
+        table.cell(infoTable, 0, 14, useOIeff ? "VAR-X(1) return (%)" : "VAR(1) return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 14, varOk ? str.tostring(varReturn, "#.##") : "n/a")
+
+        table.cell(infoTable, 0, 15, "Horizon (bars)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 15, str.tostring(horizon))
