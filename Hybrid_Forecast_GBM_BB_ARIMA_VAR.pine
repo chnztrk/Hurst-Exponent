@@ -27,7 +27,18 @@
 // regressor and the script falls back to plain VAR(1). Correlation
 // between open interest and price is reported so the added regressor's
 // relevance can be judged rather than assumed.
-indicator("Hybrid Monte Carlo Forecast: GBM+BB+ARIMA+VAR [Celik & Celik 2025]", shorttitle = "Hybrid Forecast", overlay = true, max_bars_back = 5000)
+// kNN pattern-matching extension: a non-parametric complement to the
+// ARIMA/VAR-X linear models. Instead of fitting one global model, it
+// z-score normalizes the most recent knnFeatureLen log-returns (the
+// current "shape") and searches every historical window of the same
+// length in the lookback range for the k most similar shapes (by
+// Euclidean distance). The forecast is the average of what those k
+// historical analogues actually did over the following `horizon` bars.
+// This is real machine learning (instance-based/lazy learning, i.e. k
+// nearest neighbors) trained on the chart's own historical data, kept
+// within Pine's per-bar computation budget by running only once on the
+// last bar rather than on every historical bar.
+indicator("Hybrid Monte Carlo Forecast: GBM+BB+ARIMA+VAR+kNN [Celik & Celik 2025]", shorttitle = "Hybrid Forecast", overlay = true, max_bars_back = 5000)
 
 // ============================ Inputs ============================
 grpData = "Data & Estimation"
@@ -42,6 +53,12 @@ grpARIMA = "ARIMA(p,1,0) / VAR-X(1)"
 arOrder = input.int(5, "ARIMA AR order p", minval = 1, maxval = 10, group = grpARIMA,
      tooltip = "Differencing order d is fixed at 1, matching the paper's fixed ARIMA(5,1,0) configuration used across all crisis periods for comparability.")
 
+grpKNN = "kNN Pattern-Matching"
+knnFeatureLen = input.int(10, "Pattern length (# recent returns)", minval = 3, maxval = 60, group = grpKNN,
+     tooltip = "Number of most recent log-return bars used as the 'shape' to match against history. Each window (query and candidates) is z-score normalized before comparison, so matching is on shape, not magnitude.")
+knnK = input.int(10, "k (number of nearest neighbors)", minval = 2, maxval = 50, group = grpKNN,
+     tooltip = "How many of the most similar historical patterns to average over when building the forecast. Larger k = smoother but less specific; smaller k = more specific but noisier.")
+
 grpOI = "Open Interest (VAR-X, optional)"
 oiSymbol = input.symbol("", "Open interest symbol (leave blank to disable)", group = grpOI,
      tooltip = "Pine has no generic built-in open-interest series, so supply a chartable symbol that publishes it — e.g. a futures/perpetual contract's dedicated OI symbol, if your broker or a data vendor lists one on TradingView (search the symbol list). Leave blank to skip and fall back to plain VAR(1).")
@@ -53,11 +70,13 @@ showBand = input.bool(true, "Show GBM 5-95% band", group = grpDisp)
 showBB = input.bool(true, "Show Brownian Bridge", group = grpDisp)
 showARIMA = input.bool(true, "Show ARIMA(p,1,0)", group = grpDisp)
 showVAR = input.bool(true, "Show VAR-X(1)", group = grpDisp)
+showKNN = input.bool(true, "Show kNN pattern-match", group = grpDisp)
 showTable = input.bool(true, "Show summary table", group = grpDisp)
 colorGBM = input.color(#2962FF, "GBM color", group = grpDisp)
 colorBB = input.color(#AB47BC, "Brownian Bridge color", group = grpDisp)
 colorARIMA = input.color(#FF6D00, "ARIMA color", group = grpDisp)
 colorVAR = input.color(#26A69A, "VAR color", group = grpDisp)
+colorKNN = input.color(#FFCA28, "kNN color", group = grpDisp)
 
 // ============================ Gaussian RNG (Box-Muller) ============================
 f_gauss() =>
@@ -171,7 +190,8 @@ var polyline gbmLowerLine = na
 var polyline bbMeanLine = na
 var polyline arimaLine = na
 var polyline varLine = na
-var table infoTable = table.new(position.top_right, 2, 16, border_width = 1)
+var polyline knnLine = na
+var table infoTable = table.new(position.top_right, 2, 20, border_width = 1)
 
 if barstate.islast
     // ---------- Historical arrays ----------
@@ -320,6 +340,85 @@ if barstate.islast
             array.set(lagBuf, 0, dHat)
         arimaReturn := (array.get(arimaPath, horizon) - lastPrice) / lastPrice * 100
 
+    // ---------- kNN pattern-matching forecast ----------
+    // Non-parametric complement to ARIMA/VAR: z-score normalize the most
+    // recent knnFeatureLen log-returns (the "query" shape), search every
+    // valid historical window of the same length in the lookback range for
+    // the knnK nearest shapes by Euclidean distance, then average what
+    // those k historical analogues actually did over the next `horizon`
+    // bars. Anchors are restricted to a <= lookback-horizon so every
+    // neighbor's forward path is fully historical (no look-ahead).
+    int featLen = knnFeatureLen
+    int poolMax = lookback - horizon
+    int poolCount = poolMax - featLen + 1
+
+    float[] queryRaw = array.new<float>(featLen)
+    for i = 0 to featLen - 1
+        array.set(queryRaw, i, array.get(logRetArr, lookback - featLen + i))
+    float qMean = array.avg(queryRaw)
+    float qStd = array.stdev(queryRaw)
+    float[] queryNorm = array.new<float>(featLen)
+    for i = 0 to featLen - 1
+        array.set(queryNorm, i, qStd > 0 ? (array.get(queryRaw, i) - qMean) / qStd : 0.0)
+
+    bool knnPoolOk = poolCount >= knnK
+    float[] nnDist = array.new<float>()
+    int[] nnAnchor = array.new<int>()
+
+    if knnPoolOk
+        for a = featLen to poolMax
+            float[] candRaw = array.new<float>(featLen)
+            for i = 0 to featLen - 1
+                array.set(candRaw, i, array.get(logRetArr, a - featLen + i))
+            float cMean = array.avg(candRaw)
+            float cStd = array.stdev(candRaw)
+            float sumSq = 0.0
+            for i = 0 to featLen - 1
+                float cn = cStd > 0 ? (array.get(candRaw, i) - cMean) / cStd : 0.0
+                float diff = array.get(queryNorm, i) - cn
+                sumSq += diff * diff
+            array.push(nnDist, math.sqrt(sumSq))
+            array.push(nnAnchor, a)
+
+    int[] sortedIdx = knnPoolOk ? array.sort_indices(nnDist, order.ascending) : array.new<int>()
+    int actualK = math.min(knnK, array.size(sortedIdx))
+    bool knnOk = knnPoolOk and actualK >= 2
+
+    float[] knnMean = array.new<float>(horizon + 1)
+    float[] knnTermRet = array.new<float>()
+    float knnSharpeSum = 0.0
+
+    if knnOk
+        float[] sumPath = array.new<float>(horizon + 1, 0.0)
+        for ni = 0 to actualK - 1
+            int idx = array.get(sortedIdx, ni)
+            int a = array.get(nnAnchor, idx)
+            float[] neighborPath = array.new<float>(horizon + 1)
+            array.set(neighborPath, 0, lastPrice)
+            float cum = 0.0
+            for t = 1 to horizon
+                cum += array.get(logRetArr, a + t - 1)
+                array.set(neighborPath, t, lastPrice * math.exp(cum))
+            for t = 0 to horizon
+                array.set(sumPath, t, array.get(sumPath, t) + array.get(neighborPath, t))
+            float termRet = (array.get(neighborPath, horizon) - lastPrice) / lastPrice
+            array.push(knnTermRet, termRet)
+            float[] retSteps = array.new<float>(horizon)
+            for t = 1 to horizon
+                float p0k = array.get(neighborPath, t - 1)
+                float p1k = array.get(neighborPath, t)
+                array.set(retSteps, t - 1, (p1k - p0k) / p0k)
+            float mretK = array.avg(retSteps)
+            float sretK = array.stdev(retSteps)
+            if sretK > 0
+                knnSharpeSum += mretK / sretK
+        for t = 0 to horizon
+            array.set(knnMean, t, array.get(sumPath, t) / actualK)
+
+    float knnVaR90 = knnOk ? -1 * array.percentile_linear_interpolation(knnTermRet, 10) * 100 : na
+    float knnAvgReturn = knnOk ? array.avg(knnTermRet) * 100 : na
+    float knnAvgSharpe = knnOk ? knnSharpeSum / actualK : na
+
     // ---------- VAR-X(1): price level regressed on its own lag, plus lagged ----------
     // open interest as an exogenous regressor when available, enabled, and
     // actually varying (a constant OI column — e.g. from a blank/invalid
@@ -385,6 +484,8 @@ if barstate.islast
         polyline.delete(arimaLine)
     if not na(varLine)
         polyline.delete(varLine)
+    if not na(knnLine)
+        polyline.delete(knnLine)
 
     if showGBM
         gbmMeanLine := polyline.new(points = f_buildPoints(gbmMean, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorGBM, line_width = 2)
@@ -397,6 +498,8 @@ if barstate.islast
         arimaLine := polyline.new(points = f_buildPoints(arimaPath, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorARIMA, line_width = 2)
     if showVAR and varOk
         varLine := polyline.new(points = f_buildPoints(varPath, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorVAR, line_width = 2)
+    if showKNN and knnOk
+        knnLine := polyline.new(points = f_buildPoints(knnMean, bar_index, horizon), curved = false, closed = false, xloc = xloc.bar_index, line_color = colorKNN, line_width = 2)
 
     // ---------- Summary table ----------
     if showTable
@@ -433,18 +536,30 @@ if barstate.islast
         table.cell(infoTable, 0, 10, "ARIMA(p,1,0) return (%)", text_halign = text.align_left)
         table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
 
-        table.cell(infoTable, 0, 11, "Open interest used in VAR-X?", text_halign = text.align_left)
+        table.cell(infoTable, 0, 11, "kNN VaR90 (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 11, knnOk ? str.tostring(knnVaR90, "#.##") : "n/a")
+
+        table.cell(infoTable, 0, 12, "kNN Avg Return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 12, knnOk ? str.tostring(knnAvgReturn, "#.##") : "n/a")
+
+        table.cell(infoTable, 0, 13, "kNN Avg Sharpe", text_halign = text.align_left)
+        table.cell(infoTable, 1, 13, knnOk ? str.tostring(knnAvgSharpe, "#.###") : "n/a")
+
+        table.cell(infoTable, 0, 14, "kNN neighbors used / pool", text_halign = text.align_left)
+        table.cell(infoTable, 1, 14, knnPoolOk ? str.tostring(actualK) + " / " + str.tostring(poolCount) : "n/a (pool too small)")
+
+        table.cell(infoTable, 0, 15, "Open interest used in VAR-X?", text_halign = text.align_left)
         oiStatus = useOIeff ? "Yes" : oiRequested ? "No (collinear w/ price — fell back to VAR(1))" : oiOk ? "No (flat/no variance)" : "No (blank/invalid symbol)"
-        table.cell(infoTable, 1, 11, oiStatus)
+        table.cell(infoTable, 1, 15, oiStatus)
 
-        table.cell(infoTable, 0, 12, "Corr(OI, Price)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 12, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
+        table.cell(infoTable, 0, 16, "Corr(OI, Price)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 16, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
 
-        table.cell(infoTable, 0, 13, "Corr(ΔOI, ΔPrice)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 13, oiOk ? str.tostring(oiCorrChange, "#.###") : "n/a")
+        table.cell(infoTable, 0, 17, "Corr(ΔOI, ΔPrice)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 17, oiOk ? str.tostring(oiCorrChange, "#.###") : "n/a")
 
-        table.cell(infoTable, 0, 14, useOIeff ? "VAR-X(1) return (%)" : "VAR(1) return (%)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 14, varOk ? str.tostring(varReturn, "#.##") : "n/a")
+        table.cell(infoTable, 0, 18, useOIeff ? "VAR-X(1) return (%)" : "VAR(1) return (%)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 18, varOk ? str.tostring(varReturn, "#.##") : "n/a")
 
-        table.cell(infoTable, 0, 15, "Horizon (bars)", text_halign = text.align_left)
-        table.cell(infoTable, 1, 15, str.tostring(horizon))
+        table.cell(infoTable, 0, 19, "Horizon (bars)", text_halign = text.align_left)
+        table.cell(infoTable, 1, 19, str.tostring(horizon))
