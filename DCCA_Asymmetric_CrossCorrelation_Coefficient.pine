@@ -40,8 +40,8 @@ lvLag = input.int(5, "Log-volatility increment lag (Δ, bars)", minval = 1, grou
      tooltip = "LV_t = log(sqrt(RV_t)) - log(sqrt(RV_(t-Δ))). Set equal to RV aggregation for a like-for-like period-over-period comparison.")
 
 grpEst = "Estimation Window"
-lookback = input.int(256, "Lookback (# observations, N)", minval = 64, group = grpEst,
-     tooltip = "Number of paired (return, log-volatility-increment) observations spanning the overlapping-window scan.")
+lookback = input.int(120, "Lookback (# observations, N)", minval = 64, group = grpEst,
+     tooltip = "Number of paired (return, log-volatility-increment) observations spanning the overlapping-window scan. Lowered from the paper-scale default (256) to react faster to trend changes — fewer stale bars dilute the up/down window classification — at the cost of noisier ρ+/ρ- estimates from fewer windows per side. Raise it back toward 200-256 if the readout looks too jumpy for your timeframe.")
 scaleS = input.int(20, "DCCA window scale (s, bars)", minval = 5, group = grpEst,
      tooltip = "Window length used for the overlapping-window DCCA fluctuation functions (window covers s+1 points). The paper sweeps s from ~10 to ~334 days; this indicator fixes one s and tracks it through time instead.")
 recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst)
