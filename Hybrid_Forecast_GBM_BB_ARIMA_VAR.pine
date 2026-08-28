@@ -265,7 +265,12 @@ if barstate.islast
     matrix<float> Xt = matrix.transpose(Xm)
     matrix<float> XtX = matrix.mult(Xt, Xm)
     matrix<float> XtY = matrix.mult(Xt, Ym)
-    matrix<float> XtXinv = matrix.inv(XtX)
+    // matrix.inv() raises a runtime error (rather than returning na) on a
+    // singular matrix, so the determinant is checked first to decide
+    // whether inversion is safe to attempt.
+    matrix<float> XtXinv = na
+    if math.abs(matrix.det(XtX)) > 1e-9
+        XtXinv := matrix.inv(XtX)
 
     bool arimaOk = not na(XtXinv)
     float[] arimaPath = array.new<float>(horizon + 1)
@@ -293,13 +298,18 @@ if barstate.islast
         arimaReturn := (array.get(arimaPath, horizon) - lastPrice) / lastPrice * 100
 
     // ---------- VAR-X(1): price level regressed on its own lag, plus lagged ----------
-    // open interest as an exogenous regressor when available and enabled.
+    // open interest as an exogenous regressor when available, enabled, and
+    // actually varying (a constant OI column — e.g. from a blank/invalid
+    // symbol resolving to a fixed value instead of na — would make the
+    // regression matrix singular).
     bool oiOk = not na(oiSeries)
-    bool useOIeff = oiOk and useOI
     float[] oiArr = array.new<float>(lookback + 1)
-    if useOIeff
+    bool oiHasVariance = false
+    if oiOk and useOI
         for i = 0 to lookback
             array.set(oiArr, i, oiSeries[lookback - i])
+        oiHasVariance := array.stdev(oiArr) > 0
+    bool useOIeff = oiOk and useOI and oiHasVariance
 
     int nColsV = useOIeff ? 3 : 2
     matrix<float> Xv = matrix.new<float>(lookback, nColsV)
@@ -313,7 +323,12 @@ if barstate.islast
     matrix<float> Xtv = matrix.transpose(Xv)
     matrix<float> XtXv = matrix.mult(Xtv, Xv)
     matrix<float> XtYv = matrix.mult(Xtv, Yv)
-    matrix<float> XtXvInv = matrix.inv(XtXv)
+    // matrix.inv() raises a runtime error (rather than returning na) on a
+    // singular matrix, so the determinant is checked first to decide
+    // whether inversion is safe to attempt.
+    matrix<float> XtXvInv = na
+    if math.abs(matrix.det(XtXv)) > 1e-9
+        XtXvInv := matrix.inv(XtXv)
 
     bool varOk = not na(XtXvInv)
     float[] varPath = array.new<float>(horizon + 1)
@@ -398,8 +413,8 @@ if barstate.islast
         table.cell(infoTable, 0, 10, "ARIMA(p,1,0) return (%)", text_halign = text.align_left)
         table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
 
-        table.cell(infoTable, 0, 11, "Open interest available?", text_halign = text.align_left)
-        table.cell(infoTable, 1, 11, oiOk ? "Yes" : "No (blank/invalid symbol)")
+        table.cell(infoTable, 0, 11, "Open interest used in VAR-X?", text_halign = text.align_left)
+        table.cell(infoTable, 1, 11, useOIeff ? "Yes" : oiOk ? "No (flat/no variance)" : "No (blank/invalid symbol)")
 
         table.cell(infoTable, 0, 12, "Corr(OI, Price)", text_halign = text.align_left)
         table.cell(infoTable, 1, 12, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
