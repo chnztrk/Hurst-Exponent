@@ -1,0 +1,181 @@
+//@version=6
+// Multifractal Model of Asset (In)Variances — live indicator
+// Based on Grobys, K. (2023), "A multifractal model of asset (in)variances",
+// J. Int. Financial Markets, Institutions & Money 85, 101767.
+// Rolling realized variance (Eq. 2-3) is tested for (1) a Paretian tail via a
+// Hill / Clauset-Shalizi-Newman MLE tail exponent (the "Noah effect", α, Eq. 8)
+// and (2) long memory via detrended fluctuation analysis (the "Joseph effect",
+// Hurst exponent H, Eq. 10-13). Dotted bands mark the paper's simulated
+// benchmark cascade (binomial bending, p=0.60, weekly data, Table 1), which the
+// paper finds matches GBP/USD and Bitcoin, while crude oil and the S&P 500
+// require the more extreme p=0.70 cascade (Table 4).
+indicator("Multifractal Asset Variance Model [Grobys 2023]", shorttitle = "MMAR Var (α, H)", overlay = false, max_bars_back = 5000, precision = 4)
+
+// ============================ Inputs ============================
+grpRV = "Realized Variance"
+srcClose = input.source(close, "Source", group = grpRV)
+rvWindow = input.int(5, "RV aggregation (bars)", minval = 1, group = grpRV,
+     tooltip = "Number of bars whose squared returns are summed into one realized-variance observation. 5 ≈ weekly, 20 ≈ monthly in the paper.")
+
+grpEst = "Estimation Window"
+lookback = input.int(256, "Lookback (# RV observations)", minval = 32, group = grpEst,
+     tooltip = "Number of realized-variance observations (z) used to estimate α and H. Should be a power of two, per the paper's binomial-cascade construction (N ∈ 2^k).")
+recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst,
+     tooltip = "Estimation is recomputed every N bars (and always on the last bar) to control script load on long history.")
+tailFraction = input.float(0.20, "Power-law tail fraction", minval = 0.02, maxval = 0.5, step = 0.01, group = grpEst,
+     tooltip = "Approximates z_min as the top X% of the window. The paper instead selects z_min by Kolmogorov-Smirnov minimization (Clauset et al., 2009); this is a fast proxy for live charting.")
+
+grpBench = "Paper Benchmark — binomial cascade p=0.60, weekly (Table 1)"
+showBenchmark = input.bool(true, "Show benchmark comparison", group = grpBench)
+benchAlphaLo = input.float(2.0965, "α 5% bound", group = grpBench)
+benchAlphaHi = input.float(3.2911, "α 95% bound", group = grpBench)
+benchHLo = input.float(0.8503, "H 5% bound", group = grpBench)
+benchHHi = input.float(0.9142, "H 95% bound", group = grpBench)
+
+grpPlot = "Display"
+showRefLines = input.bool(true, "Show reference lines (H=0.5, α=2, α=3)", group = grpPlot)
+showTable = input.bool(true, "Show summary table", group = grpPlot)
+
+// ============================ Realized variance (Eq. 2-3) ============================
+logRet = math.log(srcClose / srcClose[1])
+rv = math.sum(logRet * logRet, rvWindow)
+
+// ============================ DFA -> Hurst exponent (Eq. 10-13) ============================
+f_dfa(float[] z, int n) =>
+    float[] y = array.new<float>(n)
+    float mZ = array.avg(z)
+    float cum = 0.0
+    for i = 0 to n - 1
+        cum += array.get(z, i) - mZ
+        array.set(y, i, cum)
+
+    int[] scales = array.new<int>()
+    int kk = 4
+    while kk <= n / 2
+        array.push(scales, kk)
+        kk *= 2
+
+    float[] logk = array.new<float>()
+    float[] logf = array.new<float>()
+    for si = 0 to array.size(scales) - 1
+        int k = array.get(scales, si)
+        int nseg = n / k
+        float sumRmse = 0.0
+        for seg = 0 to nseg - 1
+            int start = seg * k
+            float sumT = 0.0
+            float sumY = 0.0
+            float sumTT = 0.0
+            float sumTY = 0.0
+            for t = 0 to k - 1
+                float yy = array.get(y, start + t)
+                sumT += t
+                sumY += yy
+                sumTT += t * t
+                sumTY += t * yy
+            float denom = k * sumTT - sumT * sumT
+            float b = denom != 0 ? (k * sumTY - sumT * sumY) / denom : 0.0
+            float a = (sumY - b * sumT) / k
+            float sse = 0.0
+            for t = 0 to k - 1
+                float resid = array.get(y, start + t) - (a + b * t)
+                sse += resid * resid
+            sumRmse += math.sqrt(sse / k)
+        float rmseK = sumRmse / nseg
+        if rmseK > 0
+            array.push(logk, math.log(k))
+            array.push(logf, math.log(rmseK))
+
+    int m = array.size(logk)
+    float H = na
+    if m >= 2
+        float sx = array.sum(logk)
+        float sy = array.sum(logf)
+        float sxx = 0.0
+        float sxy = 0.0
+        for i = 0 to m - 1
+            float xx = array.get(logk, i)
+            float yy = array.get(logf, i)
+            sxx += xx * xx
+            sxy += xx * yy
+        float d = m * sxx - sx * sx
+        H := d != 0 ? (m * sxy - sx * sy) / d : na
+    H
+
+// ============================ Tail exponent (Hill / Clauset-Shalizi-Newman MLE, Eq. 8) ============================
+f_powerlaw(float[] z, int n, float q) =>
+    float[] sorted = array.copy(z)
+    array.sort(sorted, order.descending)
+    int ntail = math.max(int(math.round(n * q)), 5)
+    float zmin = array.get(sorted, ntail - 1)
+    float sumLog = 0.0
+    for i = 0 to ntail - 1
+        sumLog += math.log(array.get(sorted, i) / zmin)
+    float alpha = sumLog > 0 ? 1.0 + ntail / sumLog : na
+    [alpha, zmin]
+
+// ============================ Estimation ============================
+var float hurstVal = na
+var float alphaVal = na
+var float zminVal = na
+
+bool doCalc = (bar_index % recalcEvery == 0) or barstate.islast
+
+if doCalc and bar_index >= lookback + rvWindow
+    float[] zArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        array.set(zArr, i, rv[lookback - 1 - i])
+    hurstVal := f_dfa(zArr, lookback)
+    [a, zm] = f_powerlaw(zArr, lookback, tailFraction)
+    alphaVal := a
+    zminVal := zm
+
+// ============================ Plots ============================
+plot(hurstVal, title = "Hurst Exponent (H) — Joseph effect", color = #2962FF, linewidth = 2)
+plot(alphaVal, title = "Power-law Exponent (α) — Noah effect", color = #FF6D00, linewidth = 2)
+plot(rv, title = "Realized Variance (z)", display = display.data_window)
+plot(zminVal, title = "z_min (tail cutoff)", display = display.data_window)
+
+hline(0.5, "H = 0.5 (random walk)", color = showRefLines ? color.new(color.gray, 40) : na, linestyle = hline.style_dashed)
+hline(2.0, "α = 2 (mean undefined below)", color = showRefLines ? color.new(color.red, 40) : na, linestyle = hline.style_dashed)
+hline(3.0, "α = 3 (variance of variance undefined below)", color = showRefLines ? color.new(color.red, 60) : na, linestyle = hline.style_dotted)
+hline(benchAlphaLo, "Benchmark α 5%", color = showBenchmark ? color.new(#FF6D00, 70) : na, linestyle = hline.style_dotted)
+hline(benchAlphaHi, "Benchmark α 95%", color = showBenchmark ? color.new(#FF6D00, 70) : na, linestyle = hline.style_dotted)
+hline(benchHLo, "Benchmark H 5%", color = showBenchmark ? color.new(#2962FF, 70) : na, linestyle = hline.style_dotted)
+hline(benchHHi, "Benchmark H 95%", color = showBenchmark ? color.new(#2962FF, 70) : na, linestyle = hline.style_dotted)
+
+// ============================ Alerts ============================
+alertcondition(ta.crossunder(alphaVal, 3), title = "Variance of variance breaks down (α<3)",
+     message = "Power-law exponent α crossed below 3: the variance of the realized-variance process is no longer defined (Grobys, 2023).")
+alertcondition(ta.crossunder(alphaVal, 2), title = "Mean of realized variance breaks down (α<2)",
+     message = "Power-law exponent α crossed below 2: extreme tail risk — the expected realized variance itself is no longer defined.")
+
+// ============================ Summary table ============================
+var table infoTable = table.new(position.top_right, 2, 7, border_width = 1)
+
+if barstate.islast and showTable
+    bool inBenchAlpha = not na(alphaVal) and alphaVal >= benchAlphaLo and alphaVal <= benchAlphaHi
+    bool inBenchH = not na(hurstVal) and hurstVal >= benchHLo and hurstVal <= benchHHi
+
+    table.cell(infoTable, 0, 0, "MMAR Variance Model", bgcolor = color.new(color.gray, 70), text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, "", bgcolor = color.new(color.gray, 70))
+
+    table.cell(infoTable, 0, 1, "Hurst (H)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, str.tostring(hurstVal, "#.####"),
+         text_color = na(hurstVal) ? color.gray : hurstVal > 1 ? color.orange : hurstVal > 0.5 ? color.green : color.red)
+
+    table.cell(infoTable, 0, 2, "Power-law α", text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, str.tostring(alphaVal, "#.####"),
+         text_color = na(alphaVal) ? color.gray : alphaVal <= 2 ? color.red : alphaVal <= 3 ? color.orange : color.green)
+
+    table.cell(infoTable, 0, 3, "z_min (tail cutoff)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, str.tostring(zminVal, "#.######"))
+
+    table.cell(infoTable, 0, 4, "Mean of RV defined?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 4, na(alphaVal) ? "n/a" : alphaVal > 2 ? "Yes" : "No (α≤2)")
+
+    table.cell(infoTable, 0, 5, "Var. of var. defined?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 5, na(alphaVal) ? "n/a" : alphaVal > 3 ? "Yes" : "No (α≤3)")
+
+    table.cell(infoTable, 0, 6, "Matches p=0.60 cascade?", text_halign = text.align_left)
+    table.cell(infoTable, 1, 6, (inBenchAlpha and inBenchH) ? "Yes (like GBP/USD, BTC)" : "No (try p=0.70, like WTI/S&P500)")
