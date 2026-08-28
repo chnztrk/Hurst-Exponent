@@ -1,0 +1,294 @@
+//@version=6
+// Asymmetric multifractal cross-correlations between price and volatility,
+// following Kakinaka, S. & Umeno, K. (2021), "Exploring asymmetric
+// multifractal cross-correlations of price-volatility and asymmetric
+// volatility dynamics in cryptocurrency markets", Physica A 581, 126237.
+// Implements the paper's MF-ADCCA method (Section 3.1): cumulative profiles
+// of price log-returns (x) and log-volatility increments (y) are split into
+// non-overlapping segments (forward AND backward, to use the whole sample),
+// each segment classified as "uptrend" or "downtrend" by the sign of a
+// linear fit on price within that segment, and separate generalized
+// cross-Hurst exponents h+_xy(q) (uptrend segments) and h-_xy(q) (downtrend
+// segments) are estimated via log-log regression across scales. The
+// asymmetry Δh_xy(q) = h+_xy(q) - h-_xy(q) is the paper's key diagnostic
+// (its Table 3): positive means price-volatility cross-correlation is more
+// persistent (higher scaling exponent) in uptrend regimes, negative means
+// more persistent in downtrend regimes.
+// Two simplifications relative to the paper, both consistent with the rest
+// of this indicator suite's MF-DFA implementations:
+//   1. Segments are detrended with a linear (order-1) fit, not the paper's
+//      degree-2 polynomial — matching every other f_mfdfa()/f_rs() function
+//      already in this repo.
+//   2. The scale range uses this repo's established power-of-two doubling
+//      (matching MMAR_RoughVolatility_LogVol.pine) rather than the paper's
+//      smin=max(20,N/100)/smax=min(20*smin,N/10) heuristic, which requires
+//      N in the thousands to stay well-defined and breaks down at Pine-sized
+//      lookbacks (~256).
+// The paper's separate asymmetric DCCA correlation coefficient (ρ_DCCA±,
+// Section 3.2 — a bounded [-1,1] correlation measure derived from a
+// DIFFERENT, overlapping-window fluctuation function) is NOT ported here;
+// only the MF-ADCCA generalized-Hurst asymmetry (Section 3.1) is. The two
+// metrics are complementary but answer different questions, so this
+// indicator's "uptrend more persistent / downtrend more persistent" readout
+// should not be read as equivalent to the paper's leverage-effect framing,
+// which relied on ρ_DCCA±, not Δh_xy.
+indicator("MF-ADCCA Asymmetric Cross-Correlation [Kakinaka & Umeno 2021]", shorttitle = "MF-ADCCA", overlay = false, max_bars_back = 5000, precision = 4)
+
+// ============================ Inputs ============================
+grpRV = "Realized Variance / Log-Volatility"
+srcClose = input.source(close, "Source", group = grpRV)
+rvWindow = input.int(5, "RV aggregation (bars)", minval = 1, group = grpRV,
+     tooltip = "Bars summed into one realized-variance observation. 5 ≈ weekly, 20 ≈ monthly.")
+lvLag = input.int(5, "Log-volatility increment lag (Δ, bars)", minval = 1, group = grpRV,
+     tooltip = "LV_t = log(sqrt(RV_t)) - log(sqrt(RV_(t-Δ))). Set equal to RV aggregation for a like-for-like period-over-period comparison.")
+
+grpEst = "Estimation Window"
+lookback = input.int(256, "Lookback (# observations)", minval = 64, group = grpEst,
+     tooltip = "Number of paired (return, log-volatility-increment) observations used per MF-ADCCA estimate. Should be a power of two.")
+recalcEvery = input.int(5, "Recalculate every N bars", minval = 1, group = grpEst)
+
+grpQ = "Generalized Cross-Hurst — q moments"
+qLow = input.float(-10.0, "Low q (weights small fluctuations)", maxval = -1.0, group = grpQ,
+     tooltip = "Negative q emphasizes small fluctuations in the price-volatility cross-covariance. Must stay below -1 to avoid the 1/q singularity near q=0.")
+qHigh = input.float(10.0, "High q (weights large fluctuations)", minval = 1.0, group = grpQ,
+     tooltip = "Positive q emphasizes large fluctuations. Must stay above 1 to avoid the 1/q singularity near q=0.")
+
+grpDisp = "Display"
+showRefLine = input.bool(true, "Show h=0.5 (no cross-correlation) line", group = grpDisp)
+showTable = input.bool(true, "Show summary table", group = grpDisp)
+colorPlus = input.color(#26A69A, "h+_xy (uptrend) color", group = grpDisp)
+colorMinus = input.color(#EF5350, "h-_xy (downtrend) color", group = grpDisp)
+
+// ============================ Linear-regression slope helper ============================
+f_slope(float[] xs, float[] ys) =>
+    int m = array.size(xs)
+    float h = na
+    if m >= 2
+        float sx = array.sum(xs)
+        float sy = array.sum(ys)
+        float sxx = 0.0
+        float sxy = 0.0
+        for i = 0 to m - 1
+            float xx = array.get(xs, i)
+            float yy = array.get(ys, i)
+            sxx += xx * xx
+            sxy += xx * yy
+        float d = m * sxx - sx * sx
+        h := d != 0 ? (m * sxy - sx * sy) / d : na
+    h
+
+// ============================ MF-ADCCA — Kakinaka & Umeno (2021), Eq. 4-9 ============================
+// Returns [hAll, hPlus, hMinus]: the overall generalized cross-Hurst
+// exponent (all segments pooled) and its uptrend/downtrend-only versions.
+f_adcca(float[] xArr, float[] yArr, float[] pArr, int n, float q) =>
+    float[] X = array.new<float>(n)
+    float[] Y = array.new<float>(n)
+    float mX = array.avg(xArr)
+    float mY = array.avg(yArr)
+    float cx = 0.0
+    float cy = 0.0
+    for i = 0 to n - 1
+        cx += array.get(xArr, i) - mX
+        cy += array.get(yArr, i) - mY
+        array.set(X, i, cx)
+        array.set(Y, i, cy)
+
+    int[] scales = array.new<int>()
+    int kk = 8
+    while kk <= n / 2
+        array.push(scales, kk)
+        kk *= 2
+
+    float[] logsAll = array.new<float>()
+    float[] logFall = array.new<float>()
+    float[] logsPlus = array.new<float>()
+    float[] logFplus = array.new<float>()
+    float[] logsMinus = array.new<float>()
+    float[] logFminus = array.new<float>()
+
+    for si = 0 to array.size(scales) - 1
+        int s = array.get(scales, si)
+        int ns = n / s
+        int total = 2 * ns
+        float sumAll = 0.0
+        float sumPlus = 0.0
+        float sumMinus = 0.0
+        int mPlus = 0
+        int mMinus = 0
+        for v = 0 to total - 1
+            int start = v < ns ? v * s : n - (v - ns + 1) * s
+            // First pass: linear-fit sums for X, Y (detrending) and P
+            // (trend-direction classifier) within this segment.
+            float sumT = 0.0
+            float sumTT = 0.0
+            float sumX = 0.0
+            float sumTX = 0.0
+            float sumY = 0.0
+            float sumTY = 0.0
+            float sumP = 0.0
+            float sumTP = 0.0
+            for t = 0 to s - 1
+                float tv = t
+                float xv = array.get(X, start + t)
+                float yv = array.get(Y, start + t)
+                float pv = array.get(pArr, start + t)
+                sumT += tv
+                sumTT += tv * tv
+                sumX += xv
+                sumTX += tv * xv
+                sumY += yv
+                sumTY += tv * yv
+                sumP += pv
+                sumTP += tv * pv
+            float denom = s * sumTT - sumT * sumT
+            float bX = denom != 0 ? (s * sumTX - sumT * sumX) / denom : 0.0
+            float aX = (sumX - bX * sumT) / s
+            float bY = denom != 0 ? (s * sumTY - sumT * sumY) / denom : 0.0
+            float aY = (sumY - bY * sumT) / s
+            float bP = denom != 0 ? (s * sumTP - sumT * sumP) / denom : 0.0
+
+            // Second pass: detrended-covariance f²(s,v) = mean(|Xresid|*|Yresid|)
+            float sumProd = 0.0
+            for t = 0 to s - 1
+                float tv = t
+                float xv = array.get(X, start + t)
+                float yv = array.get(Y, start + t)
+                float xResid = math.abs(xv - (aX + bX * tv))
+                float yResid = math.abs(yv - (aY + bY * tv))
+                sumProd += xResid * yResid
+            float f2 = math.max(sumProd / s, 1e-12)
+            float f2q = math.pow(f2, q / 2.0)
+
+            sumAll += f2q
+            if bP >= 0
+                sumPlus += f2q
+                mPlus += 1
+            else
+                sumMinus += f2q
+                mMinus += 1
+
+        if total > 0
+            float Fall = math.pow(sumAll / total, 1.0 / q)
+            if Fall > 0
+                array.push(logsAll, math.log(s))
+                array.push(logFall, math.log(Fall))
+        if mPlus > 0
+            float Fplus = math.pow(sumPlus / mPlus, 1.0 / q)
+            if Fplus > 0
+                array.push(logsPlus, math.log(s))
+                array.push(logFplus, math.log(Fplus))
+        if mMinus > 0
+            float Fminus = math.pow(sumMinus / mMinus, 1.0 / q)
+            if Fminus > 0
+                array.push(logsMinus, math.log(s))
+                array.push(logFminus, math.log(Fminus))
+
+    float hAll = f_slope(logsAll, logFall)
+    float hPlus = f_slope(logsPlus, logFplus)
+    float hMinus = f_slope(logsMinus, logFminus)
+    [hAll, hPlus, hMinus]
+
+// ============================ Estimation ============================
+logRet = math.log(srcClose / srcClose[1])
+rv = math.sum(logRet * logRet, rvWindow)
+logVol = 0.5 * math.log(rv)
+lv = logVol - logVol[lvLag]
+
+var float hAll2 = na
+var float hPlus2 = na
+var float hMinus2 = na
+var float hAllLow = na
+var float hPlusLow = na
+var float hMinusLow = na
+var float hAllHigh = na
+var float hPlusHigh = na
+var float hMinusHigh = na
+
+bool doCalc = (bar_index % recalcEvery == 0) or barstate.islast
+
+if doCalc and bar_index >= lookback + rvWindow + lvLag
+    float[] xArr = array.new<float>(lookback)
+    float[] yArr = array.new<float>(lookback)
+    float[] pArr = array.new<float>(lookback)
+    for i = 0 to lookback - 1
+        array.set(xArr, i, logRet[lookback - 1 - i])
+        array.set(yArr, i, lv[lookback - 1 - i])
+        array.set(pArr, i, srcClose[lookback - 1 - i])
+
+    [a2, p2, m2] = f_adcca(xArr, yArr, pArr, lookback, 2.0)
+    hAll2 := a2
+    hPlus2 := p2
+    hMinus2 := m2
+
+    [aLow, pLow, mLow] = f_adcca(xArr, yArr, pArr, lookback, qLow)
+    hAllLow := aLow
+    hPlusLow := pLow
+    hMinusLow := mLow
+
+    [aHigh, pHigh, mHigh] = f_adcca(xArr, yArr, pArr, lookback, qHigh)
+    hAllHigh := aHigh
+    hPlusHigh := pHigh
+    hMinusHigh := mHigh
+
+float deltaH2 = hPlus2 - hMinus2
+float deltaHLow = hPlusLow - hMinusLow
+float deltaHHigh = hPlusHigh - hMinusHigh
+float dXY = (math.abs(hAllLow - 0.5) + math.abs(hAllHigh - 0.5)) / 2.0
+
+// ============================ Plots ============================
+p1 = plot(hPlus2, title = "h+_xy(2) — uptrend segments", color = colorPlus, linewidth = 2)
+p2 = plot(hMinus2, title = "h-_xy(2) — downtrend segments", color = colorMinus, linewidth = 2)
+fill(p1, p2, color = deltaH2 >= 0 ? color.new(colorPlus, 85) : color.new(colorMinus, 85))
+
+hline(0.5, "h = 0.5 (no cross-correlation)", color = showRefLine ? color.new(color.gray, 40) : na, linestyle = hline.style_dashed)
+
+// ============================ Alerts ============================
+alertcondition(ta.crossover(deltaH2, 0.0), title = "Asymmetry flips to uptrend-dominant",
+     message = "Δh_xy(2) crossed above zero: price-volatility cross-correlation is now more persistent in uptrend segments (Kakinaka & Umeno, 2021).")
+alertcondition(ta.crossunder(deltaH2, 0.0), title = "Asymmetry flips to downtrend-dominant",
+     message = "Δh_xy(2) crossed below zero: price-volatility cross-correlation is now more persistent in downtrend segments (Kakinaka & Umeno, 2021).")
+
+// ============================ Summary table ============================
+var table infoTable = table.new(position.top_right, 2, 13, border_width = 1)
+
+if barstate.islast and showTable
+    table.cell(infoTable, 0, 0, "MF-ADCCA (Kakinaka & Umeno 2021)", bgcolor = color.new(color.gray, 70), text_color = color.white, text_halign = text.align_left)
+    table.cell(infoTable, 1, 0, "", bgcolor = color.new(color.gray, 70))
+
+    table.cell(infoTable, 0, 1, "h+_xy(2) [uptrend]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 1, str.tostring(hPlus2, "#.####"))
+
+    table.cell(infoTable, 0, 2, "h-_xy(2) [downtrend]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 2, str.tostring(hMinus2, "#.####"))
+
+    table.cell(infoTable, 0, 3, "Δh_xy(2) = h+ - h-", text_halign = text.align_left)
+    table.cell(infoTable, 1, 3, str.tostring(deltaH2, "#.####"),
+         text_color = na(deltaH2) ? color.gray : deltaH2 >= 0 ? colorPlus : colorMinus)
+
+    regimeText = na(deltaH2) ? "n/a" : math.abs(deltaH2) < 0.02 ? "Symmetric (|Δh|<0.02)" : deltaH2 > 0 ? "More persistent in UPTREND" : "More persistent in DOWNTREND"
+    table.cell(infoTable, 0, 4, "Regime", text_halign = text.align_left)
+    table.cell(infoTable, 1, 4, regimeText)
+
+    table.cell(infoTable, 0, 5, "h+_xy(qLow) [small fluct.]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 5, str.tostring(hPlusLow, "#.####"))
+
+    table.cell(infoTable, 0, 6, "h-_xy(qLow) [small fluct.]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 6, str.tostring(hMinusLow, "#.####"))
+
+    table.cell(infoTable, 0, 7, "Δh_xy(qLow)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 7, str.tostring(deltaHLow, "#.####"))
+
+    table.cell(infoTable, 0, 8, "h+_xy(qHigh) [large fluct.]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 8, str.tostring(hPlusHigh, "#.####"))
+
+    table.cell(infoTable, 0, 9, "h-_xy(qHigh) [large fluct.]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 9, str.tostring(hMinusHigh, "#.####"))
+
+    table.cell(infoTable, 0, 10, "Δh_xy(qHigh)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 10, str.tostring(deltaHHigh, "#.####"))
+
+    table.cell(infoTable, 0, 11, "D_xy (inefficiency, overall)", text_halign = text.align_left)
+    table.cell(infoTable, 1, 11, str.tostring(dXY, "#.####"))
+
+    table.cell(infoTable, 0, 12, "h_xy(2) [overall, informational]", text_halign = text.align_left)
+    table.cell(infoTable, 1, 12, str.tostring(hAll2, "#.####"))
