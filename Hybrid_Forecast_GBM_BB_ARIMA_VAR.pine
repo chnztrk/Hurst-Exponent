@@ -130,6 +130,29 @@ f_buildPoints(float[] vals, int startBar, int hz) =>
         array.push(pts, chart.point.from_index(startBar + t, array.get(vals, t)))
     pts
 
+// ============================ VAR(1) / VAR-X(1) OLS fit via normal equations ============================
+// Fits price_t on [1, price_(t-1)] or [1, price_(t-1), oi_(t-1)]. Returns na
+// matrices (rather than raising) when the system is singular — e.g. when
+// open interest is (near-)perfectly collinear with price, which makes the
+// two predictors mathematically indistinguishable.
+f_fitVar(float[] closesArrLocal, float[] oiArrLocal, int lb, bool withOI) =>
+    int nc = withOI ? 3 : 2
+    matrix<float> X = matrix.new<float>(lb, nc)
+    matrix<float> Y = matrix.new<float>(lb, 1)
+    for i = 0 to lb - 1
+        matrix.set(X, i, 0, 1.0)
+        matrix.set(X, i, 1, array.get(closesArrLocal, i))
+        if withOI
+            matrix.set(X, i, 2, array.get(oiArrLocal, i))
+        matrix.set(Y, i, 0, array.get(closesArrLocal, i + 1))
+    matrix<float> Xt = matrix.transpose(X)
+    matrix<float> XtX = matrix.mult(Xt, X)
+    matrix<float> XtY = matrix.mult(Xt, Y)
+    matrix<float> XtXinv = na
+    if math.abs(matrix.det(XtX)) > 1e-9
+        XtXinv := matrix.inv(XtX)
+    [XtXinv, XtY]
+
 // ============================ Open interest fetch + correlation (must run every bar) ============================
 // request.security() and ta.* functions must be called unconditionally at
 // the script's top level rather than inside the barstate.islast block
@@ -309,28 +332,25 @@ if barstate.islast
         for i = 0 to lookback
             array.set(oiArr, i, oiSeries[lookback - i])
         oiHasVariance := array.stdev(oiArr) > 0
-    bool useOIeff = oiOk and useOI and oiHasVariance
+    bool oiRequested = oiOk and useOI and oiHasVariance
 
-    int nColsV = useOIeff ? 3 : 2
-    matrix<float> Xv = matrix.new<float>(lookback, nColsV)
-    matrix<float> Yv = matrix.new<float>(lookback, 1)
-    for i = 0 to lookback - 1
-        matrix.set(Xv, i, 0, 1.0)
-        matrix.set(Xv, i, 1, array.get(closesArr, i))
-        if useOIeff
-            matrix.set(Xv, i, 2, array.get(oiArr, i))
-        matrix.set(Yv, i, 0, array.get(closesArr, i + 1))
-    matrix<float> Xtv = matrix.transpose(Xv)
-    matrix<float> XtXv = matrix.mult(Xtv, Xv)
-    matrix<float> XtYv = matrix.mult(Xtv, Yv)
-    // matrix.inv() raises a runtime error (rather than returning na) on a
-    // singular matrix, so the determinant is checked first to decide
-    // whether inversion is safe to attempt.
-    matrix<float> XtXvInv = na
-    if math.abs(matrix.det(XtXv)) > 1e-9
-        XtXvInv := matrix.inv(XtXv)
+    [XtXvInv1, XtYv1] = f_fitVar(closesArr, oiArr, lookback, oiRequested)
+    bool var1Ok = not na(XtXvInv1)
+    bool useOIeff = oiRequested and var1Ok
 
-    bool varOk = not na(XtXvInv)
+    matrix<float> XtXvInv = XtXvInv1
+    matrix<float> XtYv = XtYv1
+    bool varOk = var1Ok
+    // If the OI-augmented system was singular (typically because OI is
+    // (near-)perfectly collinear with price — a strong hint the supplied
+    // symbol isn't independent open-interest data), automatically retry
+    // as plain VAR(1) rather than giving up with no forecast at all.
+    if oiRequested and not var1Ok
+        [XtXvInv2, XtYv2] = f_fitVar(closesArr, oiArr, lookback, false)
+        XtXvInv := XtXvInv2
+        XtYv := XtYv2
+        varOk := not na(XtXvInv2)
+
     float[] varPath = array.new<float>(horizon + 1)
     float varReturn = na
     if varOk
@@ -414,7 +434,8 @@ if barstate.islast
         table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
 
         table.cell(infoTable, 0, 11, "Open interest used in VAR-X?", text_halign = text.align_left)
-        table.cell(infoTable, 1, 11, useOIeff ? "Yes" : oiOk ? "No (flat/no variance)" : "No (blank/invalid symbol)")
+        oiStatus = useOIeff ? "Yes" : oiRequested ? "No (collinear w/ price — fell back to VAR(1))" : oiOk ? "No (flat/no variance)" : "No (blank/invalid symbol)"
+        table.cell(infoTable, 1, 11, oiStatus)
 
         table.cell(infoTable, 0, 12, "Corr(OI, Price)", text_halign = text.align_left)
         table.cell(infoTable, 1, 12, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
