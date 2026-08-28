@@ -18,12 +18,15 @@
 // score accuracy against.
 // VAR-X extension: following Do (2026), "Maturation of Bitcoin market
 // microstructure" (VAR-X with VIX as an exogenous control), the plain
-// VAR(1) is extended with lagged open interest as an exogenous regressor
-// when the symbol reports it (mainly perpetual/futures contracts) — a
-// proxy for aggregate long/short positioning, since Pine cannot fetch an
-// external long/short-ratio API directly. Correlation between open
-// interest and price is reported so the added regressor's relevance can
-// be judged rather than assumed.
+// VAR(1) can be extended with lagged open interest as an exogenous
+// regressor — a proxy for aggregate long/short positioning, since Pine
+// cannot fetch an external long/short-ratio API directly. Pine has no
+// generic built-in open-interest series available for every symbol, so
+// the user supplies a chartable open-interest symbol (if one exists for
+// their instrument/broker) via an input; leaving it blank disables the
+// regressor and the script falls back to plain VAR(1). Correlation
+// between open interest and price is reported so the added regressor's
+// relevance can be judged rather than assumed.
 indicator("Hybrid Monte Carlo Forecast: GBM+BB+ARIMA+VAR [Celik & Celik 2025]", shorttitle = "Hybrid Forecast", overlay = true, max_bars_back = 5000)
 
 // ============================ Inputs ============================
@@ -38,8 +41,11 @@ nPaths = input.int(200, "Monte Carlo paths (GBM/BB)", minval = 20, maxval = 1000
 grpARIMA = "ARIMA(p,1,0) / VAR-X(1)"
 arOrder = input.int(5, "ARIMA AR order p", minval = 1, maxval = 10, group = grpARIMA,
      tooltip = "Differencing order d is fixed at 1, matching the paper's fixed ARIMA(5,1,0) configuration used across all crisis periods for comparability.")
-useOI = input.bool(true, "Use open interest as VAR-X exogenous regressor", group = grpARIMA,
-     tooltip = "Extends VAR(1) into VAR-X(1) by adding lagged open interest as a second predictor (a positioning/crowding proxy, since Pine cannot fetch an external long/short-ratio feed). Falls back to plain VAR(1) automatically if the symbol does not report open interest (typical for spot pairs).")
+
+grpOI = "Open Interest (VAR-X, optional)"
+oiSymbol = input.symbol("", "Open interest symbol (leave blank to disable)", group = grpOI,
+     tooltip = "Pine has no generic built-in open-interest series, so supply a chartable symbol that publishes it — e.g. a futures/perpetual contract's dedicated OI symbol, if your broker or a data vendor lists one on TradingView (search the symbol list). Leave blank to skip and fall back to plain VAR(1).")
+useOI = input.bool(true, "Use open interest as VAR-X exogenous regressor (if symbol given)", group = grpOI)
 
 grpDisp = "Display"
 showGBM = input.bool(true, "Show GBM", group = grpDisp)
@@ -124,12 +130,16 @@ f_buildPoints(float[] vals, int startBar, int hz) =>
         array.push(pts, chart.point.from_index(startBar + t, array.get(vals, t)))
     pts
 
-// ============================ Open interest correlation (must run every bar) ============================
-// ta.* functions maintain rolling state across bars, so they must be called
-// unconditionally here rather than inside the barstate.islast block below,
-// or they would not have "seen" the prior bars and would return wrong values.
-float oiCorrLevel = ta.correlation(open_interest, srcClose, lookback)
-float oiCorrChange = ta.correlation(ta.change(open_interest), ta.change(srcClose), lookback)
+// ============================ Open interest fetch + correlation (must run every bar) ============================
+// request.security() and ta.* functions must be called unconditionally at
+// the script's top level rather than inside the barstate.islast block
+// below: request.security() needs to run every bar to resolve correctly,
+// and ta.* functions maintain rolling state that requires seeing every
+// prior bar. ignore_invalid_symbol=true makes a blank/invalid oiSymbol
+// resolve to na instead of raising a runtime error.
+float oiSeries = request.security(oiSymbol, timeframe.period, close, ignore_invalid_symbol = true)
+float oiCorrLevel = ta.correlation(oiSeries, srcClose, lookback)
+float oiCorrChange = ta.correlation(ta.change(oiSeries), ta.change(srcClose), lookback)
 
 // ============================ Persistent drawing objects ============================
 var polyline gbmMeanLine = na
@@ -284,12 +294,12 @@ if barstate.islast
 
     // ---------- VAR-X(1): price level regressed on its own lag, plus lagged ----------
     // open interest as an exogenous regressor when available and enabled.
-    bool oiOk = not na(open_interest)
+    bool oiOk = not na(oiSeries)
     bool useOIeff = oiOk and useOI
     float[] oiArr = array.new<float>(lookback + 1)
     if useOIeff
         for i = 0 to lookback
-            array.set(oiArr, i, open_interest[lookback - i])
+            array.set(oiArr, i, oiSeries[lookback - i])
 
     int nColsV = useOIeff ? 3 : 2
     matrix<float> Xv = matrix.new<float>(lookback, nColsV)
@@ -389,7 +399,7 @@ if barstate.islast
         table.cell(infoTable, 1, 10, arimaOk ? str.tostring(arimaReturn, "#.##") : "n/a")
 
         table.cell(infoTable, 0, 11, "Open interest available?", text_halign = text.align_left)
-        table.cell(infoTable, 1, 11, oiOk ? "Yes" : "No (spot symbol?)")
+        table.cell(infoTable, 1, 11, oiOk ? "Yes" : "No (blank/invalid symbol)")
 
         table.cell(infoTable, 0, 12, "Corr(OI, Price)", text_halign = text.align_left)
         table.cell(infoTable, 1, 12, oiOk ? str.tostring(oiCorrLevel, "#.###") : "n/a")
