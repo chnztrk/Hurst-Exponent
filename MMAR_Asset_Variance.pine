@@ -166,20 +166,23 @@ f_norm(float v, float lo, float hi) => (v - lo) / (hi - lo) * 100
 plotH = normalizeView ? f_norm(hurstVal, normHLo, normHHi) : hurstVal
 plotA = normalizeView ? f_norm(alphaVal, normALo, normAHi) : alphaVal
 
-refH05 = normalizeView ? f_norm(0.5, normHLo, normHHi) : 0.5
-refA2 = normalizeView ? f_norm(2.0, normALo, normAHi) : 2.0
-refA3 = normalizeView ? f_norm(3.0, normALo, normAHi) : 3.0
-refBenchALo = normalizeView ? f_norm(benchAlphaLo, normALo, normAHi) : benchAlphaLo
-refBenchAHi = normalizeView ? f_norm(benchAlphaHi, normALo, normAHi) : benchAlphaHi
-refBenchHLo = normalizeView ? f_norm(benchHLo, normHLo, normHHi) : benchHLo
-refBenchHHi = normalizeView ? f_norm(benchHHi, normHLo, normHHi) : benchHHi
-
-titleH = normalizeView ? "Hurst Exponent (H) — normalized 0-100" : "Hurst Exponent (H) — Joseph effect"
-titleA = normalizeView ? "Power-law Exponent (α) — normalized 0-100" : "Power-law Exponent (α) — Noah effect"
+// hline() requires an "input float" price; calling a user-defined function
+// (f_norm) always downgrades the result to "series float", so these are
+// computed with plain inline arithmetic instead of f_norm() to keep them
+// "input"-qualified.
+refH05 = normalizeView ? (0.5 - normHLo) / (normHHi - normHLo) * 100 : 0.5
+refA2 = normalizeView ? (2.0 - normALo) / (normAHi - normALo) * 100 : 2.0
+refA3 = normalizeView ? (3.0 - normALo) / (normAHi - normALo) * 100 : 3.0
+refBenchALo = normalizeView ? (benchAlphaLo - normALo) / (normAHi - normALo) * 100 : benchAlphaLo
+refBenchAHi = normalizeView ? (benchAlphaHi - normALo) / (normAHi - normALo) * 100 : benchAlphaHi
+refBenchHLo = normalizeView ? (benchHLo - normHLo) / (normHHi - normHLo) * 100 : benchHLo
+refBenchHHi = normalizeView ? (benchHHi - normHLo) / (normHHi - normHLo) * 100 : benchHHi
 
 // ============================ Plots ============================
-plot(plotH, title = titleH, color = #2962FF, linewidth = 2)
-plot(plotA, title = titleA, color = #FF6D00, linewidth = 2)
+// plot()'s title must be a const string, so it cannot switch text based on
+// normalizeView; the tooltip on normalizeView already explains the mode.
+plot(plotH, title = "Hurst Exponent (H)", color = #2962FF, linewidth = 2)
+plot(plotA, title = "Power-law Exponent (α)", color = #FF6D00, linewidth = 2)
 plot(rv, title = "Realized Variance (z) — raw", display = display.data_window)
 plot(zminVal, title = "z_min (tail cutoff) — raw", display = display.data_window)
 plot(hurstVal, title = "Hurst Exponent (H) — raw", display = display.data_window)
